@@ -7,35 +7,47 @@ localIP = "127.0.0.1"
 in_port = 6600
 out_port = 6655
 maxSize = 4096
-initialized = False
+initialized_rx = False
+initialized_tx = False
 UDPClientSocketOut = None
 UDPClientSocketIn = None
 
-def initialize():
-    global UDPClientSocketOut
+verbose = False
+
+def initialize_rx():
     global UDPClientSocketIn
-    global initialized
-    UDPClientSocketOut = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+    global initialized_rx
     UDPClientSocketIn = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
     UDPClientSocketIn.bind(("", in_port))
-    print("Control sockets initialized")
-    initialized = True
+    if verbose:
+        print("Input control socket initialized")
+    initialized_rx = True
+
+def initialize_tx():
+    global UDPClientSocketOut
+    global initialized_tx
+    UDPClientSocketOut = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+    if verbose:
+        print("Output control socket initialized")
+    initialized_tx = True
 
 def receive_from_socket():
     global initialized
     global UDPClientSocketIn
-    print("receiving")
-    if not initialized:
-        initialize()
+    if verbose:
+        print("receiving")
+    if not initialized_rx:
+        initialize_rx()
     bytesAddressPair = UDPClientSocketIn.recvfrom(maxSize)
-    print("received {} bytes".format(len(bytesAddressPair[0])))
+    if verbose:
+        print("received {} bytes".format(len(bytesAddressPair[0])))
     return bytesAddressPair[0]
 
-def sent_to_socket(data):
+def send_to_socket(data):
     global UDPClientSocketOut
     global initialized
-    if not initialized:
-        initialize()
+    if not initialized_tx:
+        initialize_tx()
     global UDPClientSocketOut
     UDPClientSocketOut.sendto(data, (localIP,out_port))
     
