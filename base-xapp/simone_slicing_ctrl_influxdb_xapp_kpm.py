@@ -21,6 +21,45 @@ CTRL_FREQ = 5          # Frequency for the slicing control
 ACTION_FILE = "slice_action.json"
 
 
+# ue_info_m field 7 (dl_mac_buffer_occupation) is set by the RAN E2 agent to
+# sched_ctrl->num_total_bytes, i.e. the total DL data [bytes] awaiting
+# transmission for the UE -> the DL buffer occupancy.
+_warned_no_buffer_field = False
+
+def get_dl_buffer_occupancy(ue):
+    """Return the DL MAC buffer occupancy [bytes] for a UE, or None if the
+    running protobuf build does not expose the field (older proto). Warns once."""
+    global _warned_no_buffer_field
+    try:
+        return float(ue.dl_mac_buffer_occupation)
+    except AttributeError:
+        if not _warned_no_buffer_field:
+            print("[buffer] WARNING: ue_info_m has no 'dl_mac_buffer_occupation' field; "
+                  "add field 7 to oai-oran-protolib's ran_messages.proto and regenerate "
+                  "the pb2 to extract DL buffer occupancy.")
+            _warned_no_buffer_field = True
+        return None
+
+
+# RLC-level DL KPMs (proto fields 26-28), summed over the UE's DRBs in the RAN:
+#   dl_rlc_sdu_arrival_bytes - cumulative offered SDU bytes at RLC ingress (exogenous
+#                              demand; offered_load = d(arrival)/dt, uncensored)
+#   dl_rlc_tx_pdu_bytes      - cumulative transmitted RLC PDU bytes (padding-free served)
+#   dl_rlc_buffer_bytes      - current RLC TX buffer occupancy
+_warned_fields = set()
+
+def get_opt_field(ue, name):
+    """Return float(ue.<name>) or None if the running pb2 lacks the field. Warns once per field."""
+    try:
+        return float(getattr(ue, name))
+    except AttributeError:
+        if name not in _warned_fields:
+            print(f"[kpm] WARNING: ue_info_m has no '{name}'; regenerate the pb2 "
+                  f"(from the RAN ran_messages.proto) to extract it.")
+            _warned_fields.add(name)
+        return None
+
+
 def trigger_indication():
     print("encoding sub request")
     master_mess = ran_messages_pb2.RAN_message()
@@ -143,18 +182,54 @@ def main():
                     nssai_sd  = ue.nssai_sD
                     avg_prbs_dl = ue.avg_prbs_dl
 
-                    # Compute throughput [Mbps] based on RNTI, timestamp, and dl_total_bytes
+                    # DL buffer occupancy [bytes]: total data awaiting transmission
+                    # for this UE. None if the proto build lacks the field.
+                    dl_buffer_occupancy = get_dl_buffer_occupancy(ue)
+
+                    # RLC-level DL KPMs (None if the proto build lacks them):
+                    #   arrival = exogenous offered SDU bytes (cumulative counter)
+                    #   tx      = transmitted RLC PDU bytes (padding-free served, cumulative)
+                    #   buffer  = current RLC TX buffer occupancy
+                    dl_rlc_arrival = get_opt_field(ue, "dl_rlc_sdu_arrival_bytes")
+                    dl_rlc_tx      = get_opt_field(ue, "dl_rlc_tx_pdu_bytes")
+                    dl_rlc_buffer  = get_opt_field(ue, "dl_rlc_buffer_bytes")
+
+                    # Compute throughput [bit/s] based on RNTI, timestamp, and dl_total_bytes
                     if rnti in ue_data_dict:
-                        dl_th = ((dl_total_bytes - ue_data_dict[rnti]['dl_total_bytes'])/(timestamp - ue_data_dict[rnti]['timestamp']))*8
-                        ul_th = ((ul_total_bytes - ue_data_dict[rnti]['ul_total_bytes'])/(timestamp - ue_data_dict[rnti]['timestamp']))*8
-                        
+                        dt = timestamp - ue_data_dict[rnti]['timestamp']
+                        dl_th = ((dl_total_bytes - ue_data_dict[rnti]['dl_total_bytes'])/dt)*8
+                        ul_th = ((ul_total_bytes - ue_data_dict[rnti]['ul_total_bytes'])/dt)*8
+
                         # Cap downlink throughput to 60 Mbps
                         # if dl_th > 60000000:
                         #     dl_th = 60000000
 
+                        # Offered load [bit/s]: bytes arriving either get transmitted
+                        # (delivered load = dl_th) or pile up in the buffer, so
+                        #   offered_load = dl_th + d(buffer)/dt * 8
+                        prev_buffer = ue_data_dict[rnti].get('dl_buffer_occupancy')
+                        if dl_buffer_occupancy is not None and prev_buffer is not None:
+                            dl_buffer_rate = ((dl_buffer_occupancy - prev_buffer)/dt)*8
+                            dl_offered_load = dl_th + dl_buffer_rate
+                        else:
+                            dl_buffer_rate = 0.0
+                            dl_offered_load = dl_th
+
+                        # Exogenous offered load [bit/s] from the RLC arrival counter:
+                        #   offered = d(arrival_bytes)/dt * 8  (uncensored under saturation,
+                        #   unlike the buffer-derivative dl_offered_load above)
+                        prev_arrival = ue_data_dict[rnti].get('dl_rlc_arrival')
+                        if dl_rlc_arrival is not None and prev_arrival is not None:
+                            dl_offered_load_rlc = ((dl_rlc_arrival - prev_arrival)/dt)*8
+                        else:
+                            dl_offered_load_rlc = 0.0
+
                     else:
                         dl_th = 0.0
                         ul_th = 0.0
+                        dl_buffer_rate = 0.0
+                        dl_offered_load = 0.0
+                        dl_offered_load_rlc = 0.0
 
                     # Add or update rnti dictionary
                     ue_data_dict[rnti] = {
@@ -164,7 +239,9 @@ def main():
                         'nssai_sst':nssai_sst,
                         'nssai_sd':nssai_sd,
                         'dl_th':dl_th,
-                        'ul_th':ul_th
+                        'ul_th':ul_th,
+                        'dl_buffer_occupancy':dl_buffer_occupancy,
+                        'dl_rlc_arrival':dl_rlc_arrival
                     }
                     # ue_data_dict[rnti]['dl_th_history'] 
 
@@ -172,6 +249,17 @@ def main():
                             .field("dl_total_bytes", dl_total_bytes).field("dl_errors", dl_errors).field("dl_bler", dl_bler).field("dl_mcs", dl_mcs)\
                             .field("ul_total_bytes", ul_total_bytes).field("ul_errors", ul_errors).field("ul_bler", ul_bler).field("ul_mcs", ul_mcs)\
                             .field("nssai_sst", nssai_sst).field("nssai_sd", nssai_sd).field("dl_th", dl_th).field("ul_th", ul_th).field("avg_prbs_dl", avg_prbs_dl)
+                    if dl_buffer_occupancy is not None:
+                        p = p.field("dl_buffer_occupancy", dl_buffer_occupancy)\
+                             .field("dl_buffer_rate", dl_buffer_rate)\
+                             .field("dl_offered_load", dl_offered_load)
+                    if dl_rlc_arrival is not None:
+                        p = p.field("dl_rlc_arrival_bytes", dl_rlc_arrival)\
+                             .field("dl_offered_load_rlc", dl_offered_load_rlc)
+                    if dl_rlc_tx is not None:
+                        p = p.field("dl_rlc_tx_bytes", dl_rlc_tx)
+                    if dl_rlc_buffer is not None:
+                        p = p.field("dl_rlc_buffer_bytes", dl_rlc_buffer)
                     print(p)
                     # logging.info('Write to influxdb: ' + repr(p))
                     write_api.write(bucket=bucket, record=p)
