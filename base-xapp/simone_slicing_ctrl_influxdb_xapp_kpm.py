@@ -20,6 +20,20 @@ import datetime
 CTRL_FREQ = 5          # Frequency for the slicing control
 ACTION_FILE = "slice_action.json"
 
+# --- Online contextual slicing policy (DEPLOYED; the bandit is trained OFFLINE) ---
+# The reward (URLLC latency-SLA) is app-layer, not an E2 KPM, so we do not LEARN online; instead we
+# DEPLOY a contextual policy floor* = f(URLLC offered load, Lambda) derived offline (doc/06 §N.6):
+# reserve >= URLLC demand fraction with a Lambda-dependent safety margin. The context (URLLC S2 RLC
+# offered load) IS a KPM (dl_offered_load_rlc). Enable with env XAPP_CONTEXTUAL=1; default off keeps
+# the static slice_action.json behavior used for data collection.
+import os, math
+CONTEXTUAL    = os.environ.get("XAPP_CONTEXTUAL", "0") == "1"
+URLLC_SD      = int(os.environ.get("URLLC_SD", 2))          # S2 nssai_sd = URLLC slice
+CELL_CAP_MBPS = float(os.environ.get("CELL_CAP_MBPS", 124.0))
+SLA_LAMBDA_MS = float(os.environ.get("URLLC_LAMBDA_MS", 20.0))
+FLOOR_MIN, FLOOR_MAX = 5, 50
+_urllc_off_ema = None      # smoothed URLLC offered load [Mbps] to avoid floor chatter
+
 
 # ue_info_m field 7 (dl_mac_buffer_occupation) is set by the RAN E2 agent to
 # sched_ctrl->num_total_bytes, i.e. the total DL data [bytes] awaiting
@@ -241,7 +255,8 @@ def main():
                         'dl_th':dl_th,
                         'ul_th':ul_th,
                         'dl_buffer_occupancy':dl_buffer_occupancy,
-                        'dl_rlc_arrival':dl_rlc_arrival
+                        'dl_rlc_arrival':dl_rlc_arrival,
+                        'dl_offered_load_rlc':dl_offered_load_rlc
                     }
                     # ue_data_dict[rnti]['dl_th_history'] 
 
@@ -271,11 +286,34 @@ def main():
                 print("Report Index:", report_index) 
                     
                 # Sending Control
-                action = read_action()
+                action = contextual_action(ue_data_dict) if CONTEXTUAL else read_action()
                 apply_slicing_action(action, control_sck)
 
 
 # slicing functions
+def _safety(lam):
+    """Lambda-dependent reserve margin (tighter latency budget -> more headroom). From the §N.6 probe:
+    floor 40% (=2x the demand at URLLC 25) met the SLA at all Lambda; minimal floor scales with demand."""
+    if lam <= 5:  return 2.0
+    if lam <= 10: return 1.7
+    if lam <= 15: return 1.4
+    return 1.3
+
+
+def contextual_action(ue_data_dict):
+    """DEPLOYED contextual policy: set the URLLC floor (s2_min) from the live URLLC offered load so the
+    latency SLA is met at minimal PRB cost. floor* = clamp(ceil(URLLC_load/cell_cap * 100 * safety(Λ)))."""
+    global _urllc_off_ema
+    off = sum(d.get('dl_offered_load_rlc', 0.0) or 0.0 for d in ue_data_dict.values()
+              if d.get('nssai_sd') == URLLC_SD) / 1e6   # aggregate URLLC offered load [Mbps]
+    _urllc_off_ema = off if _urllc_off_ema is None else 0.5 * _urllc_off_ema + 0.5 * off
+    floor = math.ceil(_urllc_off_ema / CELL_CAP_MBPS * 100.0 * _safety(SLA_LAMBDA_MS))
+    floor = max(FLOOR_MIN, min(FLOOR_MAX, floor))
+    print(f"[contextual] URLLC offered={_urllc_off_ema:.1f} Mbps  Λ={SLA_LAMBDA_MS:.0f}ms  -> s2_min={floor}%")
+    return {"s1": {"sst": 1, "sd": 16777215, "min": 0,          "max": 100},
+            "s2": {"sst": 1, "sd": URLLC_SD,  "min": int(floor), "max": 100}}
+
+
 _last_good_action = None
 
 def read_action():
