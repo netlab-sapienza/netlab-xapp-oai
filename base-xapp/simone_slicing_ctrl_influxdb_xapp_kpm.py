@@ -101,6 +101,8 @@ def trigger_slicing_control(s_first, s_second):
             slicing_mess.sd = s["sd"]
         slicing_mess.min_ratio = s["min"]
         slicing_mess.max_ratio = s["max"]
+        if s.get("dedicated") is not None:
+            slicing_mess.dedicated_ratio = s["dedicated"]
 
         ctrl_mess = ran_messages_pb2.RAN_param_map_entry()
         ctrl_mess.key = ran_messages_pb2.RAN_parameter.SLICING_CONTROL
@@ -346,11 +348,20 @@ def apply_slicing_action(action, ctrl_sock):
     if s1["min"] + s2["min"] > 100:
         print(f"[action] WARNING sum of mins {s1['min']}+{s2['min']} > 100; skipping.")
         return
+    if s1.get("dedicated", 0) + s2.get("dedicated", 0) > 100:
+        print(f"[action] WARNING sum of dedicated {s1.get('dedicated',0)}+{s2.get('dedicated',0)} > 100; skipping.")
+        return
 
-    # Decide which slice's min is decreasing relative to current state; send it first.
+    # Decide which slice's min/dedicated is decreasing relative to current state; send it first,
+    # to avoid a transient sum>100 while the gNB applies the two slices' entries sequentially.
+    # This is a heuristic covering one slice changing min and/or dedicated at a time; it does not
+    # generally solve simultaneous opposite-direction changes on BOTH slices' BOTH fields (not
+    # needed today: only URLLC's dedicated_ratio is ever swept, eMBB's stays fixed).
     if _last_applied is not None:
-        d1 = s1["min"] - _last_applied["s1"]["min"]
-        d2 = s2["min"] - _last_applied["s2"]["min"]
+        d1 = min(s1["min"] - _last_applied["s1"]["min"],
+                 s1.get("dedicated", 0) - _last_applied["s1"].get("dedicated", 0))
+        d2 = min(s2["min"] - _last_applied["s2"]["min"],
+                 s2.get("dedicated", 0) - _last_applied["s2"].get("dedicated", 0))
         first, second = (s2, s1) if d2 < d1 else (s1, s2)
     else:
         # No prior state: send smaller-min first (safe against startup policy)
