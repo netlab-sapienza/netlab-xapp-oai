@@ -27,6 +27,7 @@ ACTION_FILE = "slice_action.json"
 # offered load) IS a KPM (dl_offered_load_rlc). Enable with env XAPP_CONTEXTUAL=1; default off keeps
 # the static slice_action.json behavior used for data collection.
 import os, math
+CONTROL_ENABLED = os.environ.get("XAPP_CONTROL", "1") != "0"
 CONTEXTUAL    = os.environ.get("XAPP_CONTEXTUAL", "0") == "1"
 URLLC_SD      = int(os.environ.get("URLLC_SD", 2))          # S2 nssai_sd = URLLC slice
 CELL_CAP_MBPS = float(os.environ.get("CELL_CAP_MBPS", 124.0))
@@ -114,6 +115,16 @@ def trigger_slicing_control(s_first, s_second):
 
 
 def main():
+
+    # Acknowledgment identifies this process, so stale files cannot certify an
+    # older xApp or a pod with multiple competing xApp processes.
+    mode_path = "/tmp/xapp_control_mode.json"
+    with open(mode_path + ".tmp", "w") as mode_file:
+        json.dump({"version": 1, "pid": os.getpid(),
+                   "control_enabled": CONTROL_ENABLED}, mode_file)
+    os.replace(mode_path + ".tmp", mode_path)
+    print(f"[control] XAPP_CONTROL={int(CONTROL_ENABLED)} "
+          f"({'enabled' if CONTROL_ENABLED else 'telemetry only'})", flush=True)
 
     waittime = 1
     print("Will wait {} seconds for xapp-sm to start".format(waittime))
@@ -284,7 +295,7 @@ def main():
                 except Exception as e:
                     print("Skip log, influxdb error: " + str(e))
      
-            if not (report_index % CTRL_FREQ):
+            if CONTROL_ENABLED and not (report_index % CTRL_FREQ):
                 print("Report Index:", report_index) 
                     
                 # Sending Control
@@ -376,4 +387,3 @@ def apply_slicing_action(action, ctrl_sock):
 
 if __name__ == '__main__':
     main()
-
