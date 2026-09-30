@@ -16,9 +16,33 @@ from influxdb_client.client.query_api import QueryOptions
 import datetime
 
 
+import os, math
+
 ## Variables
-CTRL_FREQ = 5          # Frequency for the slicing control
+# The action file is checked on EVERY KPM report and a new command is sent at
+# once, so it reaches the gNB within one report (~1 s). "New" means the driver
+# rewrote the file (it does so every window, even when the arm repeats, and
+# waits for a fresh gNB 'Applied' line) or the action content changed. An
+# unchanged action is re-sent every CTRL_FREQ reports: the E2 agent link is
+# UDP, and a re-send is idempotent on the gNB (it sets the same ratios again).
+CTRL_FREQ = 5          # Re-send period of an unchanged action, in KPM reports
 ACTION_FILE = "slice_action.json"
+
+# --- Schedule mode (env XAPP_SCHEDULE=<path>) ---------------------------------
+# Instead of slice_action.json, follow a schedule written before the episode
+# (tools/collection/xapp_schedule.py): {"id", "start_epoch", "dt", "actions",
+# "neutral"}, where each action has the slice_action.json format. On every KPM
+# report the current window is k = floor((now - start_epoch) / dt): actions[k]
+# inside the schedule, "neutral" before it starts and after it ends. The index
+# is computed from the start time rather than counted, so a late report delays
+# one switch by less than a report interval and the delay never accumulates.
+# A switch is sent at once (a repeated arm too, so every window gets a fresh
+# gNB 'Applied' line) and the held action is re-sent every CTRL_FREQ reports.
+# The file is reloaded when it is replaced (cp + mv); a schedule with no
+# actions cancels, i.e. holds "neutral". Every send is appended to
+# SCHEDULE_LOG with its planned and actual time.
+SCHEDULE_PATH = os.environ.get("XAPP_SCHEDULE") or None
+SCHEDULE_LOG = "/tmp/xapp_schedule_log.jsonl"
 
 # --- Online contextual slicing policy (DEPLOYED; the bandit is trained OFFLINE) ---
 # The reward (URLLC latency-SLA) is app-layer, not an E2 KPM, so we do not LEARN online; instead we
@@ -26,7 +50,6 @@ ACTION_FILE = "slice_action.json"
 # reserve >= URLLC demand fraction with a Lambda-dependent safety margin. The context (URLLC S2 RLC
 # offered load) IS a KPM (dl_offered_load_rlc). Enable with env XAPP_CONTEXTUAL=1; default off keeps
 # the static slice_action.json behavior used for data collection.
-import os, math
 CONTROL_ENABLED = os.environ.get("XAPP_CONTROL", "1") != "0"
 CONTEXTUAL    = os.environ.get("XAPP_CONTEXTUAL", "0") == "1"
 URLLC_SD      = int(os.environ.get("URLLC_SD", 2))          # S2 nssai_sd = URLLC slice
@@ -121,10 +144,14 @@ def main():
     mode_path = "/tmp/xapp_control_mode.json"
     with open(mode_path + ".tmp", "w") as mode_file:
         json.dump({"version": 1, "pid": os.getpid(),
-                   "control_enabled": CONTROL_ENABLED}, mode_file)
+                   "control_enabled": CONTROL_ENABLED,
+                   "schedule": SCHEDULE_PATH}, mode_file)
     os.replace(mode_path + ".tmp", mode_path)
     print(f"[control] XAPP_CONTROL={int(CONTROL_ENABLED)} "
-          f"({'enabled' if CONTROL_ENABLED else 'telemetry only'})", flush=True)
+          f"({'enabled' if CONTROL_ENABLED else 'telemetry only'})"
+          + (f", schedule {SCHEDULE_PATH}" if SCHEDULE_PATH else ""), flush=True)
+    if SCHEDULE_PATH and CONTEXTUAL:
+        raise SystemExit("XAPP_SCHEDULE and XAPP_CONTEXTUAL are exclusive")
 
     waittime = 1
     print("Will wait {} seconds for xapp-sm to start".format(waittime))
@@ -149,6 +176,8 @@ def main():
     query_api = client.query_api(query_options=QueryOptions())
 
     report_index = 0
+    last_action_stamp = None   # (inode, mtime) of the action file last sent
+    last_schedule_key = None   # (schedule id, file stamp, window) last sent
 
     ue_data_dict = {}   # Initialize an empty dictionary to store UE data
 
@@ -295,12 +324,26 @@ def main():
                 except Exception as e:
                     print("Skip log, influxdb error: " + str(e))
      
-            if CONTROL_ENABLED and not (report_index % CTRL_FREQ):
-                print("Report Index:", report_index) 
-                    
-                # Sending Control
+            if CONTROL_ENABLED and SCHEDULE_PATH:
+                # Schedule mode: switch at window boundaries, else re-send
+                now = time()
+                action, key = scheduled_action(now)
+                if action is not None:
+                    switch = key != last_schedule_key
+                    if switch or not (report_index % CTRL_FREQ):
+                        print("Report Index:", report_index)
+                        if apply_slicing_action(action, control_sck):
+                            log_schedule_send(key, action, now, resend=not switch)
+                            last_schedule_key = key
+            elif CONTROL_ENABLED:
+                # Sending Control: immediately on change, else every CTRL_FREQ reports
+                stamp = None if CONTEXTUAL else action_file_stamp()
                 action = contextual_action(ue_data_dict) if CONTEXTUAL else read_action()
-                apply_slicing_action(action, control_sck)
+                new = action != _last_applied or stamp != last_action_stamp
+                if new or not (report_index % CTRL_FREQ):
+                    print("Report Index:", report_index)
+                    apply_slicing_action(action, control_sck)
+                    last_action_stamp = stamp
 
 
 # slicing functions
@@ -325,6 +368,87 @@ def contextual_action(ue_data_dict):
     print(f"[contextual] URLLC offered={_urllc_off_ema:.1f} Mbps  Λ={SLA_LAMBDA_MS:.0f}ms  -> s2_min={floor}%")
     return {"s1": {"sst": 1, "sd": 16777215, "min": 0,          "max": 100},
             "s2": {"sst": 1, "sd": URLLC_SD,  "min": int(floor), "max": 100}}
+
+
+def file_stamp(path):
+    """Identity of a file the driver replaces with cp + mv: a new inode or
+    mtime marks a new command even when the content is identical."""
+    try:
+        st = os.stat(path)
+        return (st.st_ino, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def action_file_stamp():
+    """Identity of the current action file: the driver replaces it for every
+    command, even when the action it carries is identical to the previous one."""
+    return file_stamp(ACTION_FILE)
+
+
+def _valid_action(action):
+    return all(key in action[sl] for sl in ("s1", "s2") for key in ("sst", "sd", "min", "max"))
+
+
+_schedule = None
+_schedule_stamp = None
+
+def load_schedule():
+    """The current schedule, reloaded when the file is replaced. A file that
+    cannot be read or is invalid keeps the previous schedule (and is retried
+    on the next report); a missing file before any schedule means no control."""
+    global _schedule, _schedule_stamp
+    stamp = file_stamp(SCHEDULE_PATH)
+    if stamp == _schedule_stamp:
+        return _schedule
+    try:
+        with open(SCHEDULE_PATH) as f:
+            raw = json.load(f)
+        start, dt = float(raw["start_epoch"]), float(raw["dt"])
+        actions, neutral = list(raw["actions"]), raw["neutral"]
+        if not (dt > 0 and math.isfinite(start)):
+            raise ValueError("dt must be positive and start_epoch finite")
+        if not all(_valid_action(a) for a in actions + [neutral]):
+            raise ValueError("every action needs s1/s2 with sst, sd, min, max")
+    except Exception as e:
+        print(f"[schedule] cannot load {SCHEDULE_PATH} ({e}); "
+              + ("keeping the previous schedule" if _schedule else "no control until it loads"))
+        return _schedule
+    _schedule = dict(id=str(raw.get("id", "")), start=start, dt=dt,
+                     actions=actions, neutral=neutral)
+    _schedule_stamp = stamp
+    print(f"[schedule] loaded '{_schedule['id']}': {len(actions)} windows of {dt:g} s "
+          f"from epoch {start:.3f}")
+    return _schedule
+
+
+def scheduled_action(now):
+    """(action, key) for time `now`: key identifies the command (schedule file
+    and window: "pre", k, or "post"), so a change of key is a switch."""
+    s = load_schedule()
+    if s is None:
+        return None, None
+    k = math.floor((now - s["start"]) / s["dt"])
+    if k < 0:
+        return s["neutral"], (s["id"], _schedule_stamp, "pre")
+    if k >= len(s["actions"]):
+        return s["neutral"], (s["id"], _schedule_stamp, "post")
+    return s["actions"][k], (s["id"], _schedule_stamp, k)
+
+
+def log_schedule_send(key, action, now, resend):
+    """Append one sent command to SCHEDULE_LOG (planned vs actual time)."""
+    window = key[2]
+    rec = {"schedule_id": key[0], "window": window, "t_send": round(now, 3),
+           "resend": resend, "s1": action["s1"], "s2": action["s2"]}
+    if isinstance(window, int):
+        rec["t_planned"] = round(_schedule["start"] + window * _schedule["dt"], 3)
+        rec["late_s"] = round(now - rec["t_planned"], 3)
+    try:
+        with open(SCHEDULE_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        print(f"[schedule] cannot write {SCHEDULE_LOG}: {e}")
 
 
 _last_good_action = None
@@ -353,15 +477,16 @@ def read_action():
 _last_applied = None
 
 def apply_slicing_action(action, ctrl_sock):
+    """Send `action` as one RIC Control message; False if it was refused."""
     global _last_applied
     s1, s2 = action["s1"], action["s2"]
 
     if s1["min"] + s2["min"] > 100:
         print(f"[action] WARNING sum of mins {s1['min']}+{s2['min']} > 100; skipping.")
-        return
+        return False
     if s1.get("dedicated", 0) + s2.get("dedicated", 0) > 100:
         print(f"[action] WARNING sum of dedicated {s1.get('dedicated',0)}+{s2.get('dedicated',0)} > 100; skipping.")
-        return
+        return False
 
     # Decide which slice's min/dedicated is decreasing relative to current state; send it first,
     # to avoid a transient sum>100 while the gNB applies the two slices' entries sequentially.
@@ -383,6 +508,7 @@ def apply_slicing_action(action, ctrl_sock):
     print(f"[action] applied (one msg): "
           f"s_sd{first['sd']} min={first['min']} -> s_sd{second['sd']} min={second['min']}")
     _last_applied = action
+    return True
         
 
 if __name__ == '__main__':
