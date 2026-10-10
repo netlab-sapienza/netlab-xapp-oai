@@ -17,6 +17,8 @@ import datetime
 
 
 import os, math
+from collections import deque
+from ncmab_live import LiveState, decide as decide_ncmab
 
 ## Variables
 # The action file is checked on EVERY KPM report and a new command is sent at
@@ -43,6 +45,26 @@ ACTION_FILE = "slice_action.json"
 # SCHEDULE_LOG with its planned and actual time.
 SCHEDULE_PATH = os.environ.get("XAPP_SCHEDULE") or None
 SCHEDULE_LOG = "/tmp/xapp_schedule_log.jsonl"
+# A schedule may carry a "policy" instead of a fixed action list: a threshold
+# rule on one slice's DL arrival rate at the gNB, decided once per window from
+# the KPM RLC arrival counters of the last context_s seconds (the offline observation's
+# e2_<slice>_dl_offered_mbps_mean) and held for the window. Its fields:
+#   {"type": "threshold", "slice_sd", "context_s", "threshold_mbps",
+#    "above", "below" (actions), "above_arm", "below_arm" (their labels),
+#    "fallback": "above" | "below" (when no load was measured yet)}
+# or a lookup table (a contextual bandit fitted offline, tools/analysis/fit_cmab.py)
+# on the arrival rates of one or more slices:
+#   {"type": "table", "context_s", "inputs": [{"name", "slice_sd", "edges", "stat"}, ...],
+#    "arms" (labels), "actions" (one per arm), "cells" (nested lists of arm
+#    indices, one level per input, len(edges) + 1 bins each: bin = number of
+#    edges below the load), "fallback" (arm index when a load is not measured yet)}
+# An input's "stat" is "mean" (the default: the rate over the whole context) or "peak"
+# (the largest rate over PEAK_SPAN_S within the context, slice_peak_mbps).
+# and "horizon" gives the number of windows. Every decision is logged with
+# the load it saw.
+ARRIVAL_KEEP_S = 30.0
+PEAK_SPAN_S = 1.0
+_ncmab_state = LiveState()
 
 # --- Online contextual slicing policy (DEPLOYED; the bandit is trained OFFLINE) ---
 # The reward (URLLC latency-SLA) is app-layer, not an E2 KPM, so we do not LEARN online; instead we
@@ -145,7 +167,11 @@ def main():
     with open(mode_path + ".tmp", "w") as mode_file:
         json.dump({"version": 1, "pid": os.getpid(),
                    "control_enabled": CONTROL_ENABLED,
-                   "schedule": SCHEDULE_PATH}, mode_file)
+                   "schedule": SCHEDULE_PATH,
+                   # schedule policy types this process can run (closed-loop episodes)
+                   "policies": ["threshold", "table", "ncmab_adapter"],
+                   # table input statistics this process can compute
+                   "stats": ["mean", "peak"]}, mode_file)
     os.replace(mode_path + ".tmp", mode_path)
     print(f"[control] XAPP_CONTROL={int(CONTROL_ENABLED)} "
           f"({'enabled' if CONTROL_ENABLED else 'telemetry only'})"
@@ -301,6 +327,8 @@ def main():
                         'dl_offered_load_rlc':dl_offered_load_rlc
                     }
                     # ue_data_dict[rnti]['dl_th_history'] 
+                    record_arrival(rnti, nssai_sd, timestamp, dl_rlc_arrival,
+                                   dl_rlc_tx, dl_rlc_buffer, dl_mcs)
 
                     p = Point("xapp-stats").tag("rnti", rnti).field("timestamp", timestamp).field("avg_rsrp", avg_rsrp).field("ph", ph).field("pcmax", pcmax)\
                             .field("dl_total_bytes", dl_total_bytes).field("dl_errors", dl_errors).field("dl_bler", dl_bler).field("dl_mcs", dl_mcs)\
@@ -327,13 +355,13 @@ def main():
             if CONTROL_ENABLED and SCHEDULE_PATH:
                 # Schedule mode: switch at window boundaries, else re-send
                 now = time()
-                action, key = scheduled_action(now)
+                action, key, info = scheduled_action(now)
                 if action is not None:
                     switch = key != last_schedule_key
                     if switch or not (report_index % CTRL_FREQ):
                         print("Report Index:", report_index)
                         if apply_slicing_action(action, control_sck):
-                            log_schedule_send(key, action, now, resend=not switch)
+                            log_schedule_send(key, action, now, resend=not switch, info=info)
                             last_schedule_key = key
             elif CONTROL_ENABLED:
                 # Sending Control: immediately on change, else every CTRL_FREQ reports
@@ -405,42 +433,257 @@ def load_schedule():
         with open(SCHEDULE_PATH) as f:
             raw = json.load(f)
         start, dt = float(raw["start_epoch"]), float(raw["dt"])
-        actions, neutral = list(raw["actions"]), raw["neutral"]
+        actions, neutral = list(raw.get("actions") or []), raw["neutral"]
+        policy = raw.get("policy")
         if not (dt > 0 and math.isfinite(start)):
             raise ValueError("dt must be positive and start_epoch finite")
-        if not all(_valid_action(a) for a in actions + [neutral]):
+        if policy is not None:
+            if actions:
+                raise ValueError("a schedule has either actions or a policy, not both")
+            if policy.get("type") == "table":
+                actions_to_check = _check_table(policy)
+            elif policy.get("type") == "ncmab_adapter":
+                actions_to_check = _check_ncmab_adapter(policy, horizon=int(raw["horizon"]))
+            elif policy.get("type") == "threshold":
+                for k in ("slice_sd", "context_s", "threshold_mbps", "above", "below"):
+                    if k not in policy:
+                        raise ValueError(f"threshold policy needs {k}")
+                if policy.get("fallback", "above") not in ("above", "below"):
+                    raise ValueError("fallback must be 'above' or 'below'")
+                actions_to_check = [policy["above"], policy["below"]]
+            else:
+                raise ValueError(f"unknown policy type {policy.get('type')!r}")
+            horizon = int(raw["horizon"])
+        else:
+            actions_to_check = actions
+            horizon = len(actions)
+        if not all(_valid_action(a) for a in actions_to_check + [neutral]):
             raise ValueError("every action needs s1/s2 with sst, sd, min, max")
     except Exception as e:
         print(f"[schedule] cannot load {SCHEDULE_PATH} ({e}); "
               + ("keeping the previous schedule" if _schedule else "no control until it loads"))
         return _schedule
     _schedule = dict(id=str(raw.get("id", "")), start=start, dt=dt,
-                     actions=actions, neutral=neutral)
+                     actions=actions, neutral=neutral, policy=policy, horizon=horizon)
     _schedule_stamp = stamp
-    print(f"[schedule] loaded '{_schedule['id']}': {len(actions)} windows of {dt:g} s "
-          f"from epoch {start:.3f}")
+    _decisions.clear()
+    print(f"[schedule] loaded '{_schedule['id']}': {horizon} windows of {dt:g} s "
+          f"from epoch {start:.3f}" + (f", {policy['type']} policy" if policy else ""))
     return _schedule
 
 
+def _check_table(policy):
+    """Validate a table policy; returns its actions."""
+    for k in ("context_s", "inputs", "arms", "actions", "cells", "fallback"):
+        if k not in policy:
+            raise ValueError(f"table policy needs {k}")
+    inputs, arms, actions = policy["inputs"], policy["arms"], policy["actions"]
+    if not inputs or len(arms) != len(actions) or not actions:
+        raise ValueError("table policy needs inputs and one action per arm")
+    for x in inputs:
+        edges = [float(e) for e in x["edges"]]
+        if "slice_sd" not in x or edges != sorted(edges):
+            raise ValueError("every table input needs a slice_sd and ascending edges")
+        if x.get("stat", "mean") not in ("mean", "peak"):
+            raise ValueError(f"unknown table input stat {x.get('stat')!r}")
+
+    def check(cell, level):
+        if level == len(inputs):
+            if not (isinstance(cell, int) and 0 <= cell < len(arms)):
+                raise ValueError(f"table cell {cell!r} is not an arm index")
+            return
+        if not isinstance(cell, list) or len(cell) != len(inputs[level]["edges"]) + 1:
+            raise ValueError(f"table level {level} needs {len(inputs[level]['edges']) + 1} bins")
+        for c in cell:
+            check(c, level + 1)
+    check(policy["cells"], 0)
+    if not (isinstance(policy["fallback"], int) and 0 <= policy["fallback"] < len(arms)):
+        raise ValueError("table fallback is not an arm index")
+    return list(actions)
+
+
+def _check_ncmab_adapter(policy, horizon):
+    """Validate the frozen neural policy, selective adapter and attack schedule."""
+    for key in ("model", "actions", "fallback", "lambda_ms", "gbr_mbps", "adapter"):
+        if key not in policy:
+            raise ValueError(f"ncmab_adapter policy needs {key}")
+    model, actions, adapter = policy["model"], policy["actions"], policy["adapter"]
+    expected_channels = [f"{sl}_{f}" for sl in ("urllc", "embb")
+                         for f in ("arr_mbps", "tx_mbps", "queue_bytes", "mcs")]
+    expected_static = ["urllc_queue_now", "embb_queue_now", "live_urllc_peak_mbps",
+                       "live_embb_mbps", *[f"prev_{x}" for x in (5, 10, 15, 20, 25, 30, 35)],
+                       "prev_neutral", "lambda_ms", "gbr_mbps"]
+    if model.get("shares") != [5, 10, 15, 20, 25, 30, 35]:
+        raise ValueError("ncmab model has an unexpected share grid")
+    if model.get("channels") != expected_channels or model.get("static") != expected_static:
+        raise ValueError("ncmab model has an unexpected state schema")
+    if len(actions) != len(model["shares"]) or not all(_valid_action(a) for a in actions):
+        raise ValueError("ncmab policy needs one valid action per model share")
+    if not (isinstance(policy["fallback"], int) and
+            policy["fallback"] in model["shares"]):
+        raise ValueError("ncmab fallback must be a model share")
+    for key in ("tau", "target_share", "output_margin", "pattern_mbps",
+                "attack_start_window", "attack_stop_window"):
+        if key not in adapter:
+            raise ValueError(f"ncmab adapter needs {key}")
+    if len(adapter["pattern_mbps"]) != 10 or adapter["target_share"] not in model["shares"]:
+        raise ValueError("ncmab adapter has an invalid trigger or target")
+    start, stop = int(adapter["attack_start_window"]), int(adapter["attack_stop_window"])
+    if not 0 <= start < stop <= horizon:
+        raise ValueError("ncmab attack window must be inside the schedule horizon")
+    return list(actions)
+
+
 def scheduled_action(now):
-    """(action, key) for time `now`: key identifies the command (schedule file
-    and window: "pre", k, or "post"), so a change of key is a switch."""
+    """(action, key, info) for time `now`: key identifies the command (schedule
+    file and window: "pre", k, or "post"), so a change of key is a switch; info
+    is a policy decision's record (None for a fixed schedule)."""
     s = load_schedule()
     if s is None:
-        return None, None
+        return None, None, None
     k = math.floor((now - s["start"]) / s["dt"])
     if k < 0:
-        return s["neutral"], (s["id"], _schedule_stamp, "pre")
-    if k >= len(s["actions"]):
-        return s["neutral"], (s["id"], _schedule_stamp, "post")
-    return s["actions"][k], (s["id"], _schedule_stamp, k)
+        return s["neutral"], (s["id"], _schedule_stamp, "pre"), None
+    if k >= s["horizon"]:
+        return s["neutral"], (s["id"], _schedule_stamp, "post"), None
+    key = (s["id"], _schedule_stamp, k)
+    if s["policy"] is None:
+        return s["actions"][k], key, None
+    if key not in _decisions:
+        previous = _decisions.get((s["id"], _schedule_stamp, k - 1))
+        prev_share = (previous[1].get("arm", ["neutral"])[0]
+                      if previous is not None else "neutral")
+        _decisions[key] = decide(s["policy"], now, window=k, prev_share=prev_share)
+    action, info = _decisions[key]
+    return action, key, info
 
 
-def log_schedule_send(key, action, now, resend):
+_decisions = {}          # (schedule id, file stamp, window) -> (action, info), made once
+_arrival = {}            # rnti -> (nssai_sd, deque of (time, cumulative RLC arrival bytes))
+
+
+def record_arrival(rnti, sd, t, arrival, tx=None, queue=None, mcs=None):
+    """Keep the last ARRIVAL_KEEP_S seconds of each UE's RLC arrival counter."""
+    if arrival is None:
+        return
+    if rnti not in _arrival or _arrival[rnti][0] != sd:
+        _arrival[rnti] = (sd, deque())
+    q = _arrival[rnti][1]
+    q.append((t, arrival))
+    while q and q[0][0] < t - ARRIVAL_KEEP_S:
+        q.popleft()
+    # The neural state keeps the genuine KPM fields.  The attack, when armed,
+    # is applied later to a private copy used only for policy inference.
+    if "_ncmab_state" in globals():
+        _ncmab_state.record(rnti, sd, t, arrival, tx, queue, mcs)
+
+
+def slice_peak_mbps(sd, t, context_s, span_s=None):
+    """Peak arrival rate of slice `sd` in the last context_s seconds [Mbps]: per UE, for
+    each report in [t - context_s, t], the rate since its last report at least span_s
+    earlier (both inside the context; a span of at least half span_s, no counter reset);
+    the largest of these, summed over the slice's UEs. Bursty URLLC changes its in-burst
+    rate between phases more than its average. None when no UE has a usable pair."""
+    span_s = PEAK_SPAN_S if span_s is None else span_s
+    total, seen = 0.0, False
+    for s, q in _arrival.values():
+        if s != sd:
+            continue
+        pts = [x for x in q if t - context_s <= x[0] <= t]
+        best = None
+        for j in range(len(pts)):
+            earlier = [x for x in pts[:j] if x[0] <= pts[j][0] - span_s]
+            if not earlier:
+                continue
+            a, b = earlier[-1], pts[j]
+            if b[0] - a[0] < 0.5 * span_s or b[1] < a[1]:
+                continue
+            r = (b[1] - a[1]) * 8 / (b[0] - a[0]) / 1e6
+            best = r if best is None else max(best, r)
+        if best is not None:
+            total += best
+            seen = True
+    return total if seen else None
+
+
+def slice_offered_mbps(sd, t, context_s):
+    """Offered load of slice `sd` over the last context_s seconds [Mbps]: per UE,
+    the increase of its cumulative arrival counter between its last sample at or
+    before t - context_s and its last sample at or before t, summed over UEs.
+    Counters refresh every other report, so only the endpoints are used (as
+    per_slice_kpm does per bin). None when no UE of the slice has a usable span."""
+    total, seen = 0.0, False
+    for s, q in _arrival.values():
+        if s != sd:
+            continue
+        past = [x for x in q if x[0] <= t]
+        if len(past) < 2:
+            continue
+        before = [x for x in past if x[0] <= t - context_s]
+        a, b = (before[-1] if before else past[0]), past[-1]
+        if b[0] - a[0] < 0.5 * context_s or b[1] < a[1]:   # too short, or counter reset
+            continue
+        total += (b[1] - a[1]) * 8 / (b[0] - a[0]) / 1e6
+        seen = True
+    return total if seen else None
+
+
+def decide(policy, now, window=None, prev_share="neutral"):
+    """One window's decision of a threshold, table or neural-adapter policy."""
+    if policy["type"] == "ncmab_adapter":
+        start = int(policy["adapter"]["attack_start_window"])
+        stop = int(policy["adapter"]["attack_stop_window"])
+        active = window is not None and start <= int(window) < stop
+        state = _ncmab_state.at(now, prev_share, policy["lambda_ms"], policy["gbr_mbps"])
+        if state is None:
+            share = int(policy["fallback"])
+            info = {"policy": "ncmab_adapter", "branch": "fallback", "arm": [share, 0],
+                    "attack_active": active, "adapter_fired": False,
+                    "adapter_score": None, "clean_arm": None}
+        else:
+            share, detail = decide_ncmab(policy["model"], state[0], state[1],
+                                         policy["adapter"], active)
+            info = {"policy": "ncmab_adapter", "branch": "attack" if active else "clean",
+                    "arm": [share, 0], **detail}
+        idx = policy["model"]["shares"].index(share)
+        print(f"[policy] neural clean={info['clean_arm']} score={info['adapter_score']} "
+              f"fired={info['adapter_fired']} attack={info['attack_active']} -> {share}")
+        return policy["actions"][idx], info
+    if policy["type"] == "table":
+        loads = [(slice_peak_mbps if x.get("stat") == "peak" else slice_offered_mbps)(
+                     int(x["slice_sd"]), now, float(policy["context_s"]))
+                 for x in policy["inputs"]]
+        if any(v is None for v in loads):
+            idx, branch = policy["fallback"], "fallback"
+        else:
+            bins = [sum(v > float(e) for e in x["edges"]) for v, x in zip(loads, policy["inputs"])]
+            idx = policy["cells"]
+            for b in bins:
+                idx = idx[b]
+            branch = ",".join(map(str, bins))
+        shown = [None if v is None else round(v, 3) for v in loads]
+        info = {"policy": "table", "load_mbps": shown[0], "loads_mbps": shown,
+                "branch": branch, "arm": policy["arms"][idx]}
+        print(f"[policy] loads {shown} Mbps -> bins {branch}, arm {info['arm']}")
+        return policy["actions"][idx], info
+    load = slice_offered_mbps(int(policy["slice_sd"]), now, float(policy["context_s"]))
+    if load is None:
+        branch = policy.get("fallback", "above")
+    else:
+        branch = "above" if load > float(policy["threshold_mbps"]) else "below"
+    info = {"policy": policy["type"], "load_mbps": None if load is None else round(load, 3),
+            "branch": branch, "arm": policy.get(branch + "_arm")}
+    print(f"[policy] load {info['load_mbps']} Mbps vs {policy['threshold_mbps']} -> {branch}")
+    return policy[branch], info
+
+
+def log_schedule_send(key, action, now, resend, info=None):
     """Append one sent command to SCHEDULE_LOG (planned vs actual time)."""
     window = key[2]
     rec = {"schedule_id": key[0], "window": window, "t_send": round(now, 3),
            "resend": resend, "s1": action["s1"], "s2": action["s2"]}
+    if info:
+        rec.update(info)
     if isinstance(window, int):
         rec["t_planned"] = round(_schedule["start"] + window * _schedule["dt"], 3)
         rec["late_s"] = round(now - rec["t_planned"], 3)
