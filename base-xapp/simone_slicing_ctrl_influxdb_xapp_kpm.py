@@ -18,7 +18,9 @@ import datetime
 
 import os, math
 from collections import deque
-from ncmab_live import LiveState, decide as decide_ncmab
+from ncmab_live import (LiveState, decide as decide_ncmab,
+                        decide_abs_guard as decide_ncmab_abs_guard,
+                        greedy as greedy_ncmab, predict as predict_ncmab)
 
 ## Variables
 # The action file is checked on EVERY KPM report and a new command is sent at
@@ -169,7 +171,8 @@ def main():
                    "control_enabled": CONTROL_ENABLED,
                    "schedule": SCHEDULE_PATH,
                    # schedule policy types this process can run (closed-loop episodes)
-                   "policies": ["threshold", "table", "ncmab_adapter"],
+                   "policies": ["threshold", "table", "ncmab", "ncmab_adapter",
+                                "ncmab_abs_guard"],
                    # table input statistics this process can compute
                    "stats": ["mean", "peak"]}, mode_file)
     os.replace(mode_path + ".tmp", mode_path)
@@ -442,8 +445,12 @@ def load_schedule():
                 raise ValueError("a schedule has either actions or a policy, not both")
             if policy.get("type") == "table":
                 actions_to_check = _check_table(policy)
+            elif policy.get("type") == "ncmab":
+                actions_to_check = _check_ncmab(policy)
             elif policy.get("type") == "ncmab_adapter":
                 actions_to_check = _check_ncmab_adapter(policy, horizon=int(raw["horizon"]))
+            elif policy.get("type") == "ncmab_abs_guard":
+                actions_to_check = _check_ncmab_abs_guard(policy)
             elif policy.get("type") == "threshold":
                 for k in ("slice_sd", "context_s", "threshold_mbps", "above", "below"):
                     if k not in policy:
@@ -502,12 +509,12 @@ def _check_table(policy):
     return list(actions)
 
 
-def _check_ncmab_adapter(policy, horizon):
-    """Validate the frozen neural policy, selective adapter and attack schedule."""
-    for key in ("model", "actions", "fallback", "lambda_ms", "gbr_mbps", "adapter"):
+def _check_ncmab(policy):
+    """Validate the clean neural policy and return its executable actions."""
+    for key in ("model", "actions", "fallback", "lambda_ms", "gbr_mbps"):
         if key not in policy:
-            raise ValueError(f"ncmab_adapter policy needs {key}")
-    model, actions, adapter = policy["model"], policy["actions"], policy["adapter"]
+            raise ValueError(f"ncmab policy needs {key}")
+    model, actions = policy["model"], policy["actions"]
     expected_channels = [f"{sl}_{f}" for sl in ("urllc", "embb")
                          for f in ("arr_mbps", "tx_mbps", "queue_bytes", "mcs")]
     expected_static = ["urllc_queue_now", "embb_queue_now", "live_urllc_peak_mbps",
@@ -522,6 +529,15 @@ def _check_ncmab_adapter(policy, horizon):
     if not (isinstance(policy["fallback"], int) and
             policy["fallback"] in model["shares"]):
         raise ValueError("ncmab fallback must be a model share")
+    return list(actions)
+
+
+def _check_ncmab_adapter(policy, horizon):
+    """Validate the frozen neural policy, selective adapter and attack schedule."""
+    actions = _check_ncmab(policy)
+    if "adapter" not in policy:
+        raise ValueError("ncmab_adapter policy needs adapter")
+    model, adapter = policy["model"], policy["adapter"]
     for key in ("tau", "target_share", "output_margin", "pattern_mbps",
                 "attack_start_window", "attack_stop_window"):
         if key not in adapter:
@@ -531,7 +547,32 @@ def _check_ncmab_adapter(policy, horizon):
     start, stop = int(adapter["attack_start_window"]), int(adapter["attack_stop_window"])
     if not 0 <= start < stop <= horizon:
         raise ValueError("ncmab attack window must be inside the schedule horizon")
-    return list(actions)
+    return actions
+
+
+def _check_ncmab_abs_guard(policy):
+    """Validate the ABS signature bank and clean counterfactual prototype."""
+    actions = _check_ncmab(policy)
+    guard = policy.get("abs_guard")
+    if not isinstance(guard, dict):
+        raise ValueError("ncmab_abs_guard policy needs abs_guard")
+    for key in ("tau", "mcs_indices", "mcs_scale", "clean_mcs_prototype", "patterns"):
+        if key not in guard:
+            raise ValueError(f"ABS guard needs {key}")
+    if (guard["mcs_indices"] != [3, 7] or len(guard["clean_mcs_prototype"]) != 10
+            or any(len(row) != 2 for row in guard["clean_mcs_prototype"])):
+        raise ValueError("ABS guard has an invalid MCS schema or clean prototype")
+    if not 0 <= float(guard["tau"]) <= 1 or float(guard["mcs_scale"]) <= 0:
+        raise ValueError("ABS guard has an invalid similarity calibration")
+    if not guard["patterns"]:
+        raise ValueError("ABS guard has no recovered patterns")
+    for item in guard["patterns"]:
+        pattern = item.get("pattern_mcs")
+        if (item.get("target_share") not in policy["model"]["shares"]
+                or not isinstance(pattern, list) or len(pattern) != 10
+                or any(not isinstance(row, list) or len(row) != 2 for row in pattern)):
+            raise ValueError("ABS guard contains an invalid recovered pattern")
+    return actions
 
 
 def scheduled_action(now):
@@ -630,6 +671,20 @@ def slice_offered_mbps(sd, t, context_s):
 
 def decide(policy, now, window=None, prev_share="neutral"):
     """One window's decision of a threshold, table or neural-adapter policy."""
+    if policy["type"] == "ncmab":
+        state = _ncmab_state.at(now, prev_share, policy["lambda_ms"], policy["gbr_mbps"])
+        if state is None:
+            share = int(policy["fallback"])
+            info = {"policy": "ncmab", "branch": "fallback", "arm": [share, 0],
+                    "q": None}
+        else:
+            q = predict_ncmab(policy["model"], state[0], state[1])
+            share = int(policy["model"]["shares"][greedy_ncmab(q)])
+            info = {"policy": "ncmab", "branch": "clean", "arm": [share, 0],
+                    "q": [round(v, 6) for v in q]}
+        idx = policy["model"]["shares"].index(share)
+        print(f"[policy] neural clean -> {share}")
+        return policy["actions"][idx], info
     if policy["type"] == "ncmab_adapter":
         start = int(policy["adapter"]["attack_start_window"])
         stop = int(policy["adapter"]["attack_stop_window"])
@@ -648,6 +703,23 @@ def decide(policy, now, window=None, prev_share="neutral"):
         idx = policy["model"]["shares"].index(share)
         print(f"[policy] neural clean={info['clean_arm']} score={info['adapter_score']} "
               f"fired={info['adapter_fired']} attack={info['attack_active']} -> {share}")
+        return policy["actions"][idx], info
+    if policy["type"] == "ncmab_abs_guard":
+        state = _ncmab_state.at(now, prev_share, policy["lambda_ms"], policy["gbr_mbps"])
+        if state is None:
+            share = int(policy["fallback"])
+            info = {"policy": "ncmab_abs_guard", "branch": "fallback", "arm": [share, 0],
+                    "raw_arm": None, "sanitized_arm": None, "abs_score": None,
+                    "abs_candidate": False, "abs_confirmed": False, "abs_blocked": False}
+        else:
+            share, detail = decide_ncmab_abs_guard(
+                policy["model"], state[0], state[1], policy["abs_guard"])
+            info = {"policy": "ncmab_abs_guard",
+                    "branch": "blocked" if detail["abs_blocked"] else "accepted",
+                    "arm": [share, 0], **detail}
+        idx = policy["model"]["shares"].index(share)
+        print(f"[policy] ABS raw={info['raw_arm']} score={info['abs_score']} "
+              f"candidate={info['abs_candidate']} confirmed={info['abs_confirmed']} -> {share}")
         return policy["actions"][idx], info
     if policy["type"] == "table":
         loads = [(slice_peak_mbps if x.get("stat") == "peak" else slice_offered_mbps)(

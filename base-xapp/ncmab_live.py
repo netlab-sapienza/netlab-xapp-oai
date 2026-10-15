@@ -228,6 +228,78 @@ def greedy(q):
     return next(i for i, value in enumerate(q) if value >= top - 1e-6)
 
 
+def replace_mcs(x, pattern, mcs_indices=(3, 7)):
+    """Return a copy whose two MCS histories are replaced by a 10x2 pattern."""
+    if len(pattern) != len(x) or any(len(row) != len(mcs_indices) for row in pattern):
+        raise ValueError("an MCS replacement pattern must have one two-channel row per state step")
+    out = [list(row) for row in x]
+    for i, values in enumerate(pattern):
+        for j, channel in enumerate(mcs_indices):
+            out[i][channel] = float(values[j])
+    return out
+
+
+def mcs_similarity(x, pattern, mcs_indices=(3, 7), scale=28.0):
+    """Scaled-RMSE similarity in [0, 1]; one means an exact MCS-pattern match."""
+    if scale <= 0:
+        raise ValueError("MCS similarity scale must be positive")
+    if len(pattern) != len(x) or any(len(row) != len(mcs_indices) for row in pattern):
+        raise ValueError("an MCS replacement pattern must have one two-channel row per state step")
+    squared = []
+    for i, values in enumerate(pattern):
+        for j, channel in enumerate(mcs_indices):
+            squared.append((float(x[i][channel]) - float(values[j])) ** 2)
+    return max(0.0, 1.0 - math.sqrt(sum(squared) / len(squared)) / scale)
+
+
+def decide_abs_guard(model, x, static, guard):
+    """Run an ABS-signature guard and return the executed share plus provenance.
+
+    The guard acts only when the closest recovered pattern exceeds its clean-calibrated
+    threshold, the raw policy selects that pattern's target, and replacing both MCS histories
+    with the frozen clean prototype makes the target disappear.
+    """
+    patterns = guard.get("patterns") or []
+    if not patterns:
+        raise ValueError("ABS guard needs at least one recovered pattern")
+    raw_q = predict(model, x, static)
+    raw_index = greedy(raw_q)
+    raw_share = int(model["shares"][raw_index])
+    matches = [mcs_similarity(x, item["pattern_mcs"],
+                              tuple(guard.get("mcs_indices", (3, 7))),
+                              float(guard.get("mcs_scale", 28.0)))
+               for item in patterns]
+    best = max(range(len(matches)), key=lambda i: matches[i])
+    matched = patterns[best]
+    score = matches[best]
+    target = int(matched["target_share"])
+    candidate = score > float(guard["tau"]) and raw_share == target
+
+    sanitized_q = None
+    sanitized_share = None
+    confirmed = False
+    if candidate:
+        sanitized_x = replace_mcs(
+            x, guard["clean_mcs_prototype"], tuple(guard.get("mcs_indices", (3, 7))))
+        sanitized_q = predict(model, sanitized_x, static)
+        sanitized_share = int(model["shares"][greedy(sanitized_q)])
+        confirmed = sanitized_share != target
+    executed = sanitized_share if confirmed else raw_share
+    return executed, {
+        "raw_arm": raw_share,
+        "sanitized_arm": sanitized_share,
+        "abs_score": round(score, 6),
+        "abs_tau": float(guard["tau"]),
+        "abs_pattern": int(matched.get("id", best)),
+        "abs_target": target,
+        "abs_candidate": bool(candidate),
+        "abs_confirmed": bool(confirmed),
+        "abs_blocked": bool(confirmed),
+        "q": [round(v, 6) for v in (sanitized_q if confirmed else raw_q)],
+        "raw_q": [round(v, 6) for v in raw_q],
+    }
+
+
 def decide(model, x, static, adapter, attack_active):
     """Return the final share and complete decision provenance."""
     clean_q = predict(model, x, static)
