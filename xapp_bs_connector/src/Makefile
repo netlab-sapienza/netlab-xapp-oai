@@ -73,7 +73,7 @@ OBJ= $(HWXAPP_OBJ) $(UTIL_OBJ) $(MSG_OBJ)  $(ASN1C_MODULES) $(E2AP_OBJ) $(E2SM_O
 
 print-%  : ; @echo $* = $($*)
 
-hw_xapp_main: $(OBJ)
+hw_xapp_main: $(OBJ) $(XAPPAGENT_SRC)
 	$(CXX) -o $@  $(OBJ) $(LIBS) $(RNIBFLAGS) $(CPPFLAGS) $(CLOGFLAGS) $(XAPPAGENT_SRC)
 
 install: hw_xapp_main

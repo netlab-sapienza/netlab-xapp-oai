@@ -1,8 +1,12 @@
 import socket
+import struct
+
+
+MAX_FRAME_BYTES = 1024 * 1024
 
 
 # open control socket
-def open_control_socket(port: int):
+def open_control_socket(port: int, on_listen=None):
 
     print('Waiting for xApp connection on port ' + str(port))
 
@@ -10,33 +14,47 @@ def open_control_socket(port: int):
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # host = socket.gethostname()
     # bind to INADDR_ANY
-    server.bind(('', port))
-
-    server.listen(5)
-
-    control_sck, client_addr = server.accept()
+    try:
+        server.bind(('', port))
+        server.listen(5)
+        if on_listen is not None:
+            on_listen()
+        control_sck, client_addr = server.accept()
+    finally:
+        server.close()
     print('xApp connected: ' + client_addr[0] + ':' + str(client_addr[1]))
 
     return control_sck
 
 
 # send through socket
-def send_socket(socket, msg: str):
-    bytes_num = socket.send(msg)
-    print('Socket sent ' + str(bytes_num) + ' bytes')
+def send_socket(socket, msg: bytes):
+    """Send one length-prefixed message, regardless of TCP write boundaries."""
+    if not isinstance(msg, bytes):
+        raise TypeError('socket message must be bytes')
+    if not 0 < len(msg) <= MAX_FRAME_BYTES:
+        raise ValueError('invalid socket message length')
+    socket.sendall(struct.pack('!I', len(msg)) + msg)
+    print('Socket sent ' + str(len(msg)) + ' bytes')
 
 
 # receive data from socker
-def receive_from_socket(socket) -> str:
+def _recv_exact(socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = socket.recv(remaining)
+        if not chunk:
+            raise ConnectionError('control socket closed during a frame')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
 
-    # print("----------receive from socket called")
 
-    data = socket.recv(4096)
-
-    if len(data) > 0:
-        # print("Received: ", str(data))
-        return data
-    else:
-        # print("received 0 data")
-        return ''
+def receive_from_socket(socket) -> bytes:
+    """Read exactly one length-prefixed message from the TCP stream."""
+    (size,) = struct.unpack('!I', _recv_exact(socket, 4))
+    if not 0 < size <= MAX_FRAME_BYTES:
+        raise ValueError('invalid socket message length: ' + str(size))
+    return _recv_exact(socket, size)
 

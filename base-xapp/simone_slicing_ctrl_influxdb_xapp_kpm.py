@@ -21,6 +21,7 @@ from collections import deque
 from ncmab_live import (LiveState, decide as decide_ncmab,
                         decide_abs_guard as decide_ncmab_abs_guard,
                         greedy as greedy_ncmab, predict as predict_ncmab)
+from sla_guard_live import decide as decide_sla_guard
 
 ## Variables
 # The action file is checked on EVERY KPM report and a new command is sent at
@@ -172,7 +173,7 @@ def main():
                    "schedule": SCHEDULE_PATH,
                    # schedule policy types this process can run (closed-loop episodes)
                    "policies": ["threshold", "table", "ncmab", "ncmab_adapter",
-                                "ncmab_abs_guard"],
+                                "ncmab_abs_guard", "ncmab_sla_guard"],
                    # table input statistics this process can compute
                    "stats": ["mean", "peak"]}, mode_file)
     os.replace(mode_path + ".tmp", mode_path)
@@ -191,12 +192,13 @@ def main():
 
     # sends the indication request to the middleware through the UDP socket used for it
     UDPClientSocketOut = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
-    UDPClientSocketOut.sendto(buf, ("127.0.0.1",7001))
+    def announce_indication_request():
+        UDPClientSocketOut.sendto(buf, ("127.0.0.1",7001))
+        print("request sent, now waiting for incoming answers")
 
-    print("request sent, now waiting for incoming answers")
-
-    # opens a TCP bidirectional socket for RIC Indication / RAN Control, always with the middleware
-    control_sck = open_control_socket(4200)
+    # Listen before notifying the middleware, so its TCP connect cannot race
+    # the creation of port 4200.
+    control_sck = open_control_socket(4200, on_listen=announce_indication_request)
 
     bucket = "wineslab-xapp-demo"
     client = InfluxDBClient.from_config_file("influx-db-config.ini")
@@ -451,6 +453,8 @@ def load_schedule():
                 actions_to_check = _check_ncmab_adapter(policy, horizon=int(raw["horizon"]))
             elif policy.get("type") == "ncmab_abs_guard":
                 actions_to_check = _check_ncmab_abs_guard(policy)
+            elif policy.get("type") == "ncmab_sla_guard":
+                actions_to_check = _check_ncmab_sla_guard(policy, horizon=int(raw["horizon"]))
             elif policy.get("type") == "threshold":
                 for k in ("slice_sd", "context_s", "threshold_mbps", "above", "below"):
                     if k not in policy:
@@ -575,6 +579,52 @@ def _check_ncmab_abs_guard(policy):
     return actions
 
 
+def _check_ncmab_sla_guard(policy, horizon):
+    actions = _check_ncmab(policy)
+    guard = policy.get("sla_guard")
+    if (not isinstance(guard, dict) or guard.get("version") != 1
+            or guard.get("feature_count") != 95 or not guard.get("trees")):
+        raise ValueError("ncmab_sla_guard needs a compatible 95-feature forest")
+    if guard.get("decision_rule") == "expected_utility":
+        models = guard.get("utility_models", {})
+        weights = guard.get("utility_weights", {})
+        if (not isinstance(models, dict) or set(models) != {"urllc", "embb"}
+                or not all(isinstance(models[name], dict)
+                           and models[name].get("version") == 1
+                           and models[name].get("feature_count") == 95
+                           and models[name].get("trees") for name in ("urllc", "embb"))
+                or not isinstance(weights, dict) or set(weights) != {"urllc", "embb"}
+                or not all(math.isfinite(float(weights[name]))
+                           and float(weights[name]) > 0 for name in ("urllc", "embb"))):
+            raise ValueError("expected-utility guard needs two compatible forests and weights")
+    elif guard.get("decision_rule") is None and "cutoff" in guard:
+        if not 0 <= float(guard["cutoff"]) <= 1:
+            raise ValueError("SLA guard cutoff outside [0,1]")
+    else:
+        raise ValueError("unknown SLA guard decision rule")
+    if guard.get("fallback_policy") != "const_sla":
+        raise ValueError("SLA guard needs an operator-fitted xApp-SAFE reference")
+    configured_sla = guard.get("fallback_sla", {})
+    if (not math.isclose(float(configured_sla.get("lambda_ms", float("nan"))),
+                         float(policy["lambda_ms"]), rel_tol=0, abs_tol=1e-9)
+            or not math.isclose(float(configured_sla.get("gbr_mbps", float("nan"))),
+                                float(policy["gbr_mbps"]), rel_tol=0, abs_tol=1e-9)):
+        raise ValueError("SLA guard xApp-SAFE reference is for a different SLA profile")
+    if guard.get("fallback_share") != policy["fallback"]:
+        raise ValueError("SLA guard fallback and policy fallback disagree")
+    trigger = policy.get("private_trigger")
+    if trigger is not None:
+        if (trigger.get("kind") != "controlled_embb_arr_tx_replace"
+                or not isinstance(trigger.get("pattern_mbps"), list)
+                or len(trigger["pattern_mbps"]) != 10
+                or any(not 0 <= float(v) <= 100 for v in trigger["pattern_mbps"])):
+            raise ValueError("invalid controlled private KPM-input trigger")
+        start, stop = int(trigger["start_window"]), int(trigger["stop_window"])
+        if not 0 <= start < stop <= horizon:
+            raise ValueError("private trigger interval outside schedule")
+    return actions
+
+
 def scheduled_action(now):
     """(action, key, info) for time `now`: key identifies the command (schedule
     file and window: "pre", k, or "post"), so a change of key is a switch; info
@@ -671,6 +721,52 @@ def slice_offered_mbps(sd, t, context_s):
 
 def decide(policy, now, window=None, prev_share="neutral"):
     """One window's decision of a threshold, table or neural-adapter policy."""
+    if policy["type"] == "ncmab_sla_guard":
+        state = _ncmab_state.at(now, prev_share, policy["lambda_ms"], policy["gbr_mbps"])
+        trigger = policy.get("private_trigger")
+        active = (trigger is not None and window is not None
+                  and int(trigger["start_window"]) <= int(window)
+                  < int(trigger["stop_window"]))
+        if state is None:
+            share = int(policy["fallback"])
+            info = {"policy": "ncmab_sla_guard", "branch": "state_fallback",
+                    "arm": [share, 0], "proposed_share": None,
+                    "private_trigger_active": active, "guard": None}
+        else:
+            x, static = state
+            if active:
+                # Controlled input-injection only: genuine KPM/Influx records remain
+                # untouched. This is not a naturally generated E2-report trigger.
+                x = [list(row) for row in x]
+                pattern = trigger["pattern_mbps"]
+                for row, value in zip(x, pattern):
+                    row[4] = row[5] = float(value)
+                static = list(static)
+                static[3] = sum(pattern) / len(pattern)
+            q, proposed = None, None
+            try:
+                q = predict_ncmab(policy["model"], x, static)
+                if not all(math.isfinite(v) for v in q):
+                    raise ValueError("non-finite neural action score")
+                proposed = int(policy["model"]["shares"][greedy_ncmab(q)])
+                share, detail = decide_sla_guard(
+                    policy["sla_guard"], x, static, proposed,
+                    fallback=int(policy["fallback"]),
+                    monitor_only=bool(policy.get("guard_monitor_only", False)))
+                branch = "blocked" if detail["blocked"] else "accepted"
+            except (ValueError, KeyError, IndexError, TypeError,
+                    OverflowError, ZeroDivisionError) as err:
+                # Missing/malformed guard evidence never sends an unvetted action.
+                share, branch = int(policy["fallback"]), "guard_error_fallback"
+                detail = {"error": str(err)}
+            info = {"policy": "ncmab_sla_guard", "branch": branch,
+                    "arm": [share, 0], "proposed_share": proposed,
+                    "private_trigger_active": active, "guard": detail,
+                    "q": None if q is None else [round(v, 6) for v in q]}
+        idx = policy["model"]["shares"].index(share)
+        print(f"[policy] SLA guard proposed={info['proposed_share']} "
+              f"trigger={active} branch={info['branch']} -> {share}")
+        return policy["actions"][idx], info
     if policy["type"] == "ncmab":
         state = _ncmab_state.at(now, prev_share, policy["lambda_ms"], policy["gbr_mbps"])
         if state is None:

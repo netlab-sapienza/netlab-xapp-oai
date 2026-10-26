@@ -392,23 +392,20 @@ void Xapp::send_ric_control_request(char* payload, int payload_len, std::string 
 void Xapp::handle_rx_msg_agent(std::string agent_ip) {
     std::cout << "Opening RX thread with agent " << agent_ip << std::endl;
 
-    const size_t max_size = 1024;
-    char buf[max_size] = {0};
-
     // listen to control from agent
     while (true) {
         if (agent_socket_fd > -1) {
-            int rcv_size = recv(agent_socket_fd, buf, max_size, 0);
-            if (rcv_size > 0) {
+            std::vector<char> buf;
+            if (receive_socket(buf)) {
+                const int rcv_size = static_cast<int>(buf.size());
                 std::cout << "Message from agent " << agent_ip << std::endl;
-                std::cout << buf << std::endl;
 
                 std::string gnb_id = "";
                 std::string control;
 
                 if (!using_protobuf) {
                     // get received message fields
-                    json buf_json = json::parse(buf);
+                    json buf_json = json::parse(std::string(buf.begin(), buf.end()));
                     gnb_id = buf_json.value("gnb_id", "");
                     control = buf_json.value("control", "");
 
@@ -420,21 +417,24 @@ void Xapp::handle_rx_msg_agent(std::string agent_ip) {
                 }
                 else {
                     std::cout << "Received Protobuf message of size " << rcv_size << std::endl;
-                    for(int i = 0; i < rcv_size; i++) {
-                        fprintf(stderr, " %hhx ", buf[i]);
-                    }
-                    fprintf(stderr, "\n");
 
                     // TODO: potentially associate socket with gnb
+                    if (gnb_id_vector.empty()) {
+                        std::cerr << "No gNB available for control request" << std::endl;
+                        continue;
+                    }
                     gnb_id = gnb_id_vector.at(0);
                     std::cout << "Sending RIC control request to gNB with ID " << gnb_id << std::endl;
 
                     // send RIC control request
-                    send_ric_control_request((char*) &buf, rcv_size, gnb_id);
+                    send_ric_control_request(buf.data(), rcv_size, gnb_id);
                 }
-
-                memset(buf, 0, max_size);
+            } else {
+                std::cerr << "Agent control socket closed or invalid frame" << std::endl;
+                break;
             }
+        } else {
+            break;
         }
     }
 }

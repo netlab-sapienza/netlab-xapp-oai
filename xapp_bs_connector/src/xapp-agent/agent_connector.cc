@@ -1,22 +1,42 @@
 #include "agent_connector.hpp"
+#include <cerrno>
+#include <chrono>
+#include <mutex>
+#include <thread>
+
+namespace {
+
+std::mutex send_mutex;
+
+bool send_all(int fd, const char* data, size_t size) {
+  while (size > 0) {
+    const ssize_t sent = send(fd, data, size, MSG_NOSIGNAL);
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent <= 0) return false;
+    data += sent;
+    size -= static_cast<size_t>(sent);
+  }
+  return true;
+}
+
+bool receive_all(int fd, char* data, size_t size) {
+  while (size > 0) {
+    const ssize_t received = recv(fd, data, size, 0);
+    if (received < 0 && errno == EINTR) continue;
+    if (received <= 0) return false;
+    data += received;
+    size -= static_cast<size_t>(received);
+  }
+  return true;
+}
+
+}  // namespace
 
 
 // open client of control socket with agent
 int open_control_socket_agent(const char* dest_ip, const int dest_port) {
 
   std::cout << "Opening control socket with host " << dest_ip << ":" << dest_port << std::endl;
-
-  int control_sckfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (control_sckfd < 0) {
-	  std::cout << "ERROR: OPEN SOCKET" << std::endl;
-      close(control_sckfd);
-      return -1;
-  }
-
-  // SET SOCKET OPTIONS TO RELEASE THE SOCKET ADDRESS IMMEDIATELY AFTER
-  // THE SOCKET IS CLOSED
-  int option(1);
-  setsockopt(control_sckfd, SOL_SOCKET, SO_REUSEADDR, (char*)&option, sizeof(option));
 
   struct sockaddr_in dest_addr = {0};
   dest_addr.sin_family = AF_INET;
@@ -25,14 +45,30 @@ int open_control_socket_agent(const char* dest_ip, const int dest_port) {
   // convert dest_ip from char* to network address
   if (inet_pton(AF_INET, dest_ip, &dest_addr.sin_addr) <= 0) {
       std::cout << "ERROR CONVERTING IP TO INTERNET ADDR" << std::endl;
-      close(control_sckfd); // if conversion fail, close the socket and return error -2
       return -2;
   }
 
-  if (connect(control_sckfd, (struct sockaddr *) &dest_addr, sizeof(dest_addr)) < 0) {
-      std::cout << "ERROR: CONNECT" << std::endl;
-      close(control_sckfd);
-      return -3;
+  int control_sckfd = -1;
+  // Python sends the initial subscription before opening its listener. A
+  // single connect can therefore race that listener and permanently lose KPMs.
+  for (int attempt = 0; attempt < 50; ++attempt) {
+    control_sckfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (control_sckfd < 0) {
+      std::cout << "ERROR: OPEN SOCKET" << std::endl;
+      return -1;
+    }
+    int option(1);
+    setsockopt(control_sckfd, SOL_SOCKET, SO_REUSEADDR, (char*)&option, sizeof(option));
+    if (connect(control_sckfd, (struct sockaddr *) &dest_addr, sizeof(dest_addr)) == 0) {
+      break;
+    }
+    close(control_sckfd);
+    control_sckfd = -1;
+    if (attempt < 49) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  if (control_sckfd < 0) {
+    std::cout << "ERROR: CONNECT after 50 attempts" << std::endl;
+    return -3;
   }
 
   // update map
@@ -80,30 +116,39 @@ void add_gnb_to_vector_unique(unsigned char* gnb_id_trans) {
 
 // send through socket
 int send_socket(const char* buf, int buf_len) {
-
-  std::cout << "send_socket: sending data of size " << buf_len << std::endl;
-  for(int i = 0; i < buf_len; i++) {
-    fprintf(stderr, " %hhx ", buf[i]);
-  }
-  fprintf(stderr, "\n");
-
-  if (agent_socket_fd == -1) {
-    std::cout << "ERROR: Could not find socket for destination " << std::endl;
+  if (buf == nullptr || buf_len <= 0 ||
+      static_cast<uint32_t>(buf_len) > MAX_AGENT_FRAME_BYTES) {
+    std::cerr << "ERROR: invalid agent message length" << std::endl;
     return -1;
   }
 
-  // const size_t max_size = 512;
-  // char buf[max_size] = "Hello, Server!";  // store the data in a buffer
-  // size_t data_size = strlen(buf);
-  int sent_size = send(agent_socket_fd, buf, buf_len, 0);
-
-  if(sent_size < 0) { // the send returns a size of -1 in case of errors
-      std::cout <<  "ERROR: SEND to agent " << std::endl;
-      return -2;
+  std::lock_guard<std::mutex> lock(send_mutex);
+  if (agent_socket_fd < 0) {
+    std::cout << "ERROR: Could not find socket for destination " << std::endl;
+    return -1;
   }
-  else {
-      std::cout << "Message sent: " << buf << std::endl;
+  const uint32_t length = htonl(static_cast<uint32_t>(buf_len));
+  if (!send_all(agent_socket_fd, reinterpret_cast<const char*>(&length), sizeof(length)) ||
+      !send_all(agent_socket_fd, buf, static_cast<size_t>(buf_len))) {
+    std::cerr << "ERROR: SEND to agent" << std::endl;
+    return -2;
   }
-
+  std::cout << "Message sent: " << buf_len << " bytes" << std::endl;
   return 0;
+}
+
+
+bool receive_socket(std::vector<char>& payload) {
+  payload.clear();
+  if (agent_socket_fd < 0) return false;
+  uint32_t network_length = 0;
+  if (!receive_all(agent_socket_fd, reinterpret_cast<char*>(&network_length),
+                   sizeof(network_length))) return false;
+  const uint32_t length = ntohl(network_length);
+  if (length == 0 || length > MAX_AGENT_FRAME_BYTES) {
+    std::cerr << "ERROR: invalid agent message length: " << length << std::endl;
+    return false;
+  }
+  payload.resize(length);
+  return receive_all(agent_socket_fd, payload.data(), length);
 }

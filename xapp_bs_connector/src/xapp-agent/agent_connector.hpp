@@ -12,6 +12,9 @@
 #include <unistd.h>
 #include <map>
 #include <vector>
+#include <cstdint>
+
+constexpr uint32_t MAX_AGENT_FRAME_BYTES = 1024 * 1024;
 
 #define AGENT_IP "127.0.0.1"
 
@@ -25,5 +28,6 @@ int open_control_socket_agent(const char* dest_ip, const int dest_port);
 void close_control_socket_agent(void);
 void add_gnb_to_vector_unique(unsigned char* gnb_id);
 int send_socket(const char* buf, int buf_len);
+bool receive_socket(std::vector<char>& payload);
 
 #endif
