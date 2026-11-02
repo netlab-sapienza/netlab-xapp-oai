@@ -70,10 +70,20 @@ def getXappName(config):
     os.environ["XAPP_NAME"] = xapp_name
 
 
+def default_xapp_binary():
+    """Prefer a newer local build over the image's installed connector."""
+    installed = "/usr/local/bin/hw_xapp_main"
+    local = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "hw_xapp_main"))
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        if not os.path.isfile(installed) or os.stat(local).st_mtime > os.stat(installed).st_mtime:
+            return local
+    return installed
+
+
 if __name__ == "__main__":
 
     import subprocess
-    cmd = ["/usr/local/bin/hw_xapp_main"]
+    cmd = [default_xapp_binary()]
         
     if len(sys.argv) > 1:
         config_file = sys.argv[1]
@@ -83,6 +93,7 @@ if __name__ == "__main__":
         
     if len(sys.argv) > 2:
         cmd[0] = sys.argv[2]
+    print("Using xApp connector binary: " + cmd[0])
 
     with open(config_file, 'r') as f:
          try:
