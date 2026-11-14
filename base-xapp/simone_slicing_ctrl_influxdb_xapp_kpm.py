@@ -22,6 +22,9 @@ from ncmab_live import (LiveState, decide as decide_ncmab,
                         decide_abs_guard as decide_ncmab_abs_guard,
                         greedy as greedy_ncmab, predict as predict_ncmab)
 from sla_guard_live import decide as decide_sla_guard
+from grid_guard_live import evaluate as evaluate_grid_guard
+from grid_guard_live import validate_trigger as validate_grid_trigger
+from grid_fast_guard import FastGuard, validate as validate_fast_grid_guard
 
 ## Variables
 # The action file is checked on EVERY KPM report and a new command is sent at
@@ -173,7 +176,7 @@ def main():
                    "schedule": SCHEDULE_PATH,
                    # schedule policy types this process can run (closed-loop episodes)
                    "policies": ["threshold", "table", "ncmab", "ncmab_adapter",
-                                "ncmab_abs_guard", "ncmab_sla_guard"],
+                                "ncmab_abs_guard", "ncmab_sla_guard", "ncmab_grid_guard"],
                    # table input statistics this process can compute
                    "stats": ["mean", "peak"]}, mode_file)
     os.replace(mode_path + ".tmp", mode_path)
@@ -366,7 +369,8 @@ def main():
                     if switch or not (report_index % CTRL_FREQ):
                         print("Report Index:", report_index)
                         if apply_slicing_action(action, control_sck):
-                            log_schedule_send(key, action, now, resend=not switch, info=info)
+                            sent_at = time() if info and info.get('policy') == 'ncmab_grid_guard' else now
+                            log_schedule_send(key, action, sent_at, resend=not switch, info=info)
                             last_schedule_key = key
             elif CONTROL_ENABLED:
                 # Sending Control: immediately on change, else every CTRL_FREQ reports
@@ -430,7 +434,7 @@ def load_schedule():
     """The current schedule, reloaded when the file is replaced. A file that
     cannot be read or is invalid keeps the previous schedule (and is retried
     on the next report); a missing file before any schedule means no control."""
-    global _schedule, _schedule_stamp
+    global _schedule, _schedule_stamp, _grid_events, _fast_grid_controller
     stamp = file_stamp(SCHEDULE_PATH)
     if stamp == _schedule_stamp:
         return _schedule
@@ -455,6 +459,19 @@ def load_schedule():
                 actions_to_check = _check_ncmab_abs_guard(policy)
             elif policy.get("type") == "ncmab_sla_guard":
                 actions_to_check = _check_ncmab_sla_guard(policy, horizon=int(raw["horizon"]))
+            elif policy.get("type") == "ncmab_grid_guard":
+                actions_to_check = _check_ncmab(policy)
+                guard = policy['grid_guard']
+                if (guard.get('schema') != 'grid_outcome_guard_v1'
+                        or guard['shares'] != [20,30,35] or guard['safe_share'] != 30
+                        or policy['fallback'] != 30 or policy['lambda_ms'] != 15
+                        or dt != 10 or not policy.get('summary_path')):
+                    raise ValueError('incompatible frozen grid controller')
+                validate_grid_trigger(policy.get('private_trigger'), int(raw['horizon']))
+                if policy.get('guard_check_interval_s') is not None:
+                    validate_fast_grid_guard(policy)
+                if policy.get('guard_monitor_only') and not policy['model'].get('provenance',{}).get('poisoned'):
+                    raise ValueError('grid controller cannot bypass the guard')
             elif policy.get("type") == "threshold":
                 for k in ("slice_sd", "context_s", "threshold_mbps", "above", "below"):
                     if k not in policy:
@@ -478,6 +495,9 @@ def load_schedule():
                      actions=actions, neutral=neutral, policy=policy, horizon=horizon)
     _schedule_stamp = stamp
     _decisions.clear()
+    _grid_events = []
+    _fast_grid_controller = (FastGuard(log_grid_check) if policy and
+        policy.get('guard_check_interval_s') is not None else None)
     print(f"[schedule] loaded '{_schedule['id']}': {horizon} windows of {dt:g} s "
           f"from epoch {start:.3f}" + (f", {policy['type']} policy" if policy else ""))
     return _schedule
@@ -519,6 +539,17 @@ def _check_ncmab(policy):
         if key not in policy:
             raise ValueError(f"ncmab policy needs {key}")
     model, actions = policy["model"], policy["actions"]
+    if model.get('schema') == 'grid_clean_cnn_v1':
+        from grid_clean_prb import validate
+        validate(model)
+        if (policy.get('type')!='ncmab_grid_guard'
+                or (policy.get('private_trigger') is not None and not model['provenance']['poisoned'])
+                or policy.get('diagnostic_low_windows',0) not in (0,2)
+                or (model['provenance']['poisoned'] and policy.get('diagnostic_low_windows',0))
+                or len(actions)!=3 or not all(_valid_action(a) for a in actions)
+                or policy['fallback']!=30):
+            raise ValueError('incompatible clean grid diagnostic')
+        return list(actions)
     expected_channels = [f"{sl}_{f}" for sl in ("urllc", "embb")
                          for f in ("arr_mbps", "tx_mbps", "queue_bytes", "mcs")]
     expected_static = ["urllc_queue_now", "embb_queue_now", "live_urllc_peak_mbps",
@@ -640,7 +671,23 @@ def scheduled_action(now):
     key = (s["id"], _schedule_stamp, k)
     if s["policy"] is None:
         return s["actions"][k], key, None
+    if s['policy'].get('guard_check_interval_s') is not None:
+        return _fast_grid_controller.action(s, _schedule_stamp, _ncmab_state, now, _grid_events)
     if key not in _decisions:
+        if s['policy']['type'] == 'ncmab_grid_guard':
+            try:
+                if any(v[1].get('experiment_invalid') for v in _decisions.values()):
+                    raise ValueError('prior controller failure: episode remains invalid')
+                _decisions[key] = evaluate_grid_guard(s['policy'], _ncmab_state, now, _grid_events, k)
+            except (ValueError, KeyError, OSError, TypeError, IndexError) as error:
+                # Allow a bridge publication/report to complete, within the existing
+                # action-timing limit. A failure is never counted as a valid decision.
+                if now - (s['start'] + k*s['dt']) < 1.5:
+                    return None, key, None
+                safe = s['policy']['actions'][s['policy']['model']['shares'].index(30)]
+                _decisions[key] = (safe, dict(policy='ncmab_grid_guard', branch='invalid_abort',
+                    arm=[30,0], error=str(error), experiment_invalid=True))
+            return _decisions[key][0], key, _decisions[key][1]
         previous = _decisions.get((s["id"], _schedule_stamp, k - 1))
         prev_share = (previous[1].get("arm", ["neutral"])[0]
                       if previous is not None else "neutral")
@@ -650,6 +697,8 @@ def scheduled_action(now):
 
 
 _decisions = {}          # (schedule id, file stamp, window) -> (action, info), made once
+_grid_events = []        # successful command sends, not proposed or future actions
+_fast_grid_controller = None
 _arrival = {}            # rnti -> (nssai_sd, deque of (time, cumulative RLC arrival bytes))
 
 
@@ -845,15 +894,26 @@ def decide(policy, now, window=None, prev_share="neutral"):
     return policy[branch], info
 
 
+def log_grid_check(record):
+    # Kept in the same archived evidence file, explicitly NOT a command send.
+    with open(SCHEDULE_LOG, 'a') as stream:
+        stream.write(json.dumps(dict(record, record_type='guard_check', resend=True)) + '\n')
+
+
 def log_schedule_send(key, action, now, resend, info=None):
     """Append one sent command to SCHEDULE_LOG (planned vs actual time)."""
     window = key[2]
+    if (_schedule.get('policy') or {}).get('type') == 'ncmab_grid_guard' and not resend:
+        _grid_events.append((now, action['s2']['max']))
+        if (_schedule.get('policy') or {}).get('guard_check_interval_s') is not None:
+            _fast_grid_controller.acknowledge(key, action, now)
     rec = {"schedule_id": key[0], "window": window, "t_send": round(now, 3),
            "resend": resend, "s1": action["s1"], "s2": action["s2"]}
     if info:
         rec.update(info)
     if isinstance(window, int):
-        rec["t_planned"] = round(_schedule["start"] + window * _schedule["dt"], 3)
+        rec["t_planned"] = round((info or {}).get('t_check_planned',
+            _schedule["start"] + window * _schedule["dt"]), 3)
         rec["late_s"] = round(now - rec["t_planned"], 3)
     try:
         with open(SCHEDULE_LOG, "a") as f:
