@@ -30,7 +30,10 @@ void signalHandler( int signum ) {
 
 int main(int argc, char *argv[]){
 
-	bool using_protobuf = false;
+	// This project's Python controller sends serialized RAN_message requests.
+	// Keep the source default aligned with the live protobuf E2/RAN path so a
+	// clean rebuild does not silently subscribe with an empty request payload.
+	bool using_protobuf = true;
 
 	// Get the thread id
 	std::thread::id my_id = std::this_thread::get_id();
