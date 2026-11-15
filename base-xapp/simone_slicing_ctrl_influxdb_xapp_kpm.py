@@ -25,6 +25,11 @@ from sla_guard_live import decide as decide_sla_guard
 from grid_guard_live import evaluate as evaluate_grid_guard
 from grid_guard_live import validate_trigger as validate_grid_trigger
 from grid_fast_guard import FastGuard, validate as validate_fast_grid_guard
+from e2_timing import TimingRecorder, mono_ns
+
+_timing = TimingRecorder.from_env()
+if _timing:
+    _timing.require_schema(ran_messages_pb2)
 
 ## Variables
 # The action file is checked on EVERY KPM report and a new command is sent at
@@ -138,13 +143,15 @@ def trigger_indication():
     # print(buf)
     return buf
 
-def trigger_slicing_control(s_first, s_second):
+def trigger_slicing_control(s_first, s_second, control_id=None):
     """Build ONE RIC Control message carrying both slices' policies.
     s_first is applied by the gNB before s_second (array order), so pass the
     slice whose min is DECREASING first to keep the intermediate sum <= 100."""
     master_mess = ran_messages_pb2.RAN_message()
     master_mess.msg_type = ran_messages_pb2.RAN_message_type.CONTROL
     inner_mess = ran_messages_pb2.RAN_control_request()
+    if control_id is not None:
+        inner_mess.control_id = control_id
 
     for s in (s_first, s_second):
         slicing_mess = ran_messages_pb2.slicing_control_m()
@@ -166,6 +173,7 @@ def trigger_slicing_control(s_first, s_second):
 
 
 def main():
+    recorder = globals().get('_timing')
 
     # Acknowledgment identifies this process, so stale files cannot certify an
     # older xApp or a pod with multiple competing xApp processes.
@@ -218,6 +226,7 @@ def main():
     while True:
         #logging.info("loop again")
         data_sck = receive_from_socket(control_sck)
+        received_ns = mono_ns() if recorder else None
         if len(data_sck) <= 0:
             logging.info("leq 0 data")
             if len(data_sck) == 0:
@@ -231,6 +240,8 @@ def main():
             print("RIC report received")
             resp = ran_messages_pb2.RAN_indication_response()
             resp.ParseFromString(data_sck)
+            if recorder:
+                recorder.report(resp, received_ns)
             # print(resp)
             # print("report index " + str(report_index))
             report_index += 1
@@ -363,7 +374,10 @@ def main():
             if CONTROL_ENABLED and SCHEDULE_PATH:
                 # Schedule mode: switch at window boundaries, else re-send
                 now = time()
+                decision_started = recorder.decision_start(_ncmab_state, now) if recorder else None
                 action, key, info = scheduled_action(now)
+                if recorder:
+                    recorder.decision_done(decision_started, info)
                 if action is not None:
                     switch = key != last_schedule_key
                     if switch or not (report_index % CTRL_FREQ):
@@ -716,6 +730,9 @@ def record_arrival(rnti, sd, t, arrival, tx=None, queue=None, mcs=None):
     # is applied later to a private copy used only for policy inference.
     if "_ncmab_state" in globals():
         _ncmab_state.record(rnti, sd, t, arrival, tx, queue, mcs)
+    recorder = globals().get('_timing')
+    if recorder:
+        recorder.ue_record(rnti, sd, t)
 
 
 def slice_peak_mbps(sd, t, context_s, span_s=None):
@@ -974,8 +991,19 @@ def apply_slicing_action(action, ctrl_sock):
         # No prior state: send smaller-min first (safe against startup policy)
         first, second = (s2, s1) if s2["min"] < s1["min"] else (s1, s2)
 
-    buf = trigger_slicing_control(first, second)
-    send_socket(ctrl_sock, buf)
+    recorder = globals().get('_timing')
+    if recorder:
+        control_id = recorder.command_start(action)
+        try:
+            buf = trigger_slicing_control(first, second, control_id=control_id)
+            send_socket(ctrl_sock, buf)
+        except Exception:
+            recorder.command_done(control_id, False)
+            raise
+        recorder.command_done(control_id, True)
+    else:
+        buf = trigger_slicing_control(first, second)
+        send_socket(ctrl_sock, buf)
     print(f"[action] applied (one msg): "
           f"s_sd{first['sd']} min={first['min']} -> s_sd{second['sd']} min={second['min']}")
     _last_applied = action
