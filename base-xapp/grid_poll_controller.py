@@ -136,10 +136,15 @@ def main():
         record('command_start',control_id=cid,step=step)
         io.queue(encode_action(messages,step['command_share'],cid),(step,cid),time.monotonic())
     def on_report(payload,mono):
+        report=None
         try:
             report=decode(messages,payload)
             accepted=evidence.ingest(report,mono,time.time())
             record('report',received_mono=mono,accepted=accepted,report=report)
+            if accepted=='accepted':
+                for rollover in evidence.last_rollovers:
+                    record('counter_rollover',counter='dl_rlc_tx_pdu_bytes',
+                           modulus=2**32,policy='single_DRB_boundary_local_uint32',**rollover)
             waiting=state['awaiting_echo']
             if accepted=='accepted' and waiting is not None:
                 step,cid,sent=waiting
@@ -152,7 +157,8 @@ def main():
                     if step['status'] in ('invalid_abort','end_neutral'):state['stopped']=True
         except (ValueError,KeyError,TypeError) as error:
             state['evidence_error']=str(error)
-            record('invalid_report',error=str(error),experiment_invalid=True)
+            record('invalid_report',error=str(error),experiment_invalid=True,
+                   received_mono=mono,report=report)
     def on_sent(sent,mono):
         step,cid=sent
         state['awaiting_echo']=(step,cid,mono)

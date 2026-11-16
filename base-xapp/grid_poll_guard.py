@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from grid_clean_prb import predict as predict_cnn, validate as validate_cnn
 from grid_guard_live import ordinary_features
 from grid_outcome_guard import decide
+from grid_poll_counters import TX_MODULUS,tx_increment
 
 SLICES = (2, 16777215)
 
@@ -42,6 +43,7 @@ class Evidence:
         self.sequence = 0
         self.ues = {}
         self.offset = None
+        self.last_rollovers = []
 
     def ingest(self, report, received_mono, received_wall):
         if report.get('clock_id') != self.clock_id:
@@ -66,7 +68,7 @@ class Evidence:
         rows = report['ues']
         if len(rows)!=2 or sorted(r['nssai_sD'] for r in rows)!=sorted(SLICES):
             raise ValueError('expected exactly one UE per slice')
-        prepared=[]
+        prepared=[];rollovers=[]
         for raw in rows:
             rnti,sd = raw['rnti'],raw['nssai_sD']
             point=dict(t=wall, mono=end, seq=seq,
@@ -79,9 +81,25 @@ class Evidence:
             prior=self.ues.get(rnti)
             if self.ues and (prior is None or prior['sd']!=sd):
                 raise ValueError('UE identity changed')
-            if prior and (point['t']<=prior['rows'][-1]['t'] or
-                          any(point[k]<prior['rows'][-1][k] for k in ('arr','tx'))):
-                raise ValueError('E2 clock/counter reset')
+            # This experimental capture requires one DRB per slice (also
+            # checked by the local sampler). OAI's per-DRB TX statistic is
+            # uint32 even though its protobuf envelope is uint64. Preserve
+            # raw reports in the log; unwrap only boundary-local rollovers,
+            # using the same .9/.1 policy as the offline feature pipeline.
+            raw_tx=point['tx']
+            tx_increment(raw_tx,raw_tx,0.)  # validate even the first raw report
+            point['raw_tx']=raw_tx
+            if prior:
+                last=prior['rows'][-1]
+                if (point['t']<=last['t'] or point['mono']<=last['mono']
+                        or point['arr']<last['arr']):
+                    raise ValueError('E2 clock/counter reset')
+                delta,wrapped=tx_increment(last['raw_tx'],raw_tx,point['mono']-last['mono'])
+                if wrapped:
+                    rollovers.append(dict(rnti=rnti,slice_sd=sd,report_seq=seq,
+                        raw_before=last['raw_tx'],raw_after=raw_tx,delta_bytes=delta,
+                        previous_source_mono=last['mono'],source_mono=point['mono']))
+                point['tx']=last['tx']+delta
             prepared.append((rnti,sd,point))
         # No partial batch updates if either slice is invalid.
         for rnti,sd,point in prepared:
@@ -91,6 +109,7 @@ class Evidence:
                 entry['rows'].popleft()
         self.instance,self.sequence=instance,seq
         self.offset=wall-end
+        self.last_rollovers=rollovers
         return 'accepted'
 
     def snapshot(self, summary, bridge_id, now, mono, max_age):
