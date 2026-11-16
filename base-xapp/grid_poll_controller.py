@@ -123,6 +123,7 @@ def main():
     io=FramedIO(sock)
     nonce=int(uuid.uuid4().hex[:8],16)<<32
     state=dict(stopped=False,counter=0,exit_code=0,evidence_error=None,awaiting_echo=None)
+    connected_mono=time.monotonic()
     def queue(step):
         state['counter']+=1
         if state['counter']>=2**32:raise ValueError('control ID exhausted')
@@ -154,6 +155,8 @@ def main():
                gnb_application_confirmed=False)
     def on_poll(tick):
         begun=time.perf_counter()
+        if evidence.instance is None and time.monotonic()-connected_mono>15:
+            raise ValueError('no validated source report within startup deadline; target unavailable')
         if io.command is not None:
             step=dict(status='send_pending')
         elif state['awaiting_echo'] is not None:

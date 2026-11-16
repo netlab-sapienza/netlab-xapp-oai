@@ -163,7 +163,11 @@ class PollGuard:
     def poll(self, evidence, summary, now, mono):
         if self.pending is not None:return dict(status='send_pending')
         if self.invalid is not None:return dict(status='halted',experiment_invalid=True,error=self.invalid)
-        if self.last_share is None:return self.command(100,'neutral',now)
+        if self.last_share is None:
+            # The connector learns the target gNB from its first indication;
+            # a connected TCP socket alone is not control-path readiness.
+            if evidence.instance is None:return dict(status='awaiting_first_source_report')
+            return self.command(100,'neutral',now)
         if now < self.start:return dict(status='warmup')
         k=math.floor((now-self.start)/10.)
         if k>=self.horizon:
