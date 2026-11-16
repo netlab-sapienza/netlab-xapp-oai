@@ -126,17 +126,19 @@ class Evidence:
 
 
 class PollGuard:
-    def __init__(self, model, guard, start, horizon, bridge_id, max_age_s=1.5):
+    def __init__(self, model, guard, start, horizon, bridge_id, max_age_s=1.5,guard_interval_s=.1):
         validate_cnn(model)
         if (model['provenance']['poisoned'] or guard.get('schema')!='grid_outcome_guard_v1'
                 or guard['shares']!=[20,30,35] or guard['safe_share']!=30
                 or guard['failure_budget']!=.01 or guard['deadline_ms']!=15
                 or type(horizon) is not int or horizon<=0 or not math.isfinite(start)
-                or not .2<=max_age_s<=1.5 or not bridge_id):
+                or not .2<=max_age_s<=1.5 or not bridge_id
+                or isinstance(guard_interval_s,bool) or guard_interval_s not in (.1,1.)):
             raise ValueError('unsupported experimental polling configuration')
         self.model,self.guard=model,guard
         self.start,self.horizon,self.bridge_id=start,horizon,bridge_id
         self.max_age=max_age_s
+        self.guard_interval=guard_interval_s;self.last_guard_slot=None
         self.events=[]; self.nominal_events=[]
         self.window=None; self.proposal=None; self.base_features=None
         self.last_evidence=None; self.last_share=None; self.pending=None
@@ -186,6 +188,14 @@ class PollGuard:
                 raise ValueError('missed nominal CNN boundary')
             if self.proposal is not None and self.last_share==30:
                 return dict(status='SAFE_latched',window=k,evidence=meta)
+            slot=math.floor((now-self.start+1e-7)/self.guard_interval)
+            # CNN boundaries keep the same 100ms readiness/freshness handling
+            # in BOTH arms. Only reconsideration of a held proposal is gated.
+            # Staleness and command acknowledgment remain checked every tick.
+            if (self.proposal is not None and self.guard_interval==1.
+                    and slot==self.last_guard_slot):
+                return dict(status='cadence_wait',window=k,evidence=meta)
+            self.last_guard_slot=slot
             if self.last_evidence is not None and (
                     meta['cutoff']<=self.last_evidence['cutoff'] or
                     any(a['report_seq']<=b['report_seq'] for a,b in
@@ -200,6 +210,7 @@ class PollGuard:
             selected,detail=decide(self.guard,features,self.proposal,30)
             self.last_evidence=meta
             info=dict(window=k,proposed_share=self.proposal,selected_share=selected,
+                      decision_at=now,guard_slot=slot,guard_check_interval_s=self.guard_interval,
                       evidence=meta,guard=detail,prediction_horizon_s=10,
                       effect_features={k:features[k] for k in self.guard['features']},
                       prb_features=self.base_features,feature_mode='rolling_source_time_v1')

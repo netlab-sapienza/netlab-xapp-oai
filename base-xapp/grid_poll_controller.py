@@ -28,6 +28,9 @@ def load_config(path):
             or c.get('stale_policy')!='SAFE_then_invalid_abort'
             or c.get('accept_rolling_input_distribution_change') is not True):
         raise ValueError('invalid experimental polling contract')
+    interval=c.get('guard_check_interval_s',.1)
+    if isinstance(interval,bool) or interval not in (.1,1.):
+        raise ValueError('guard reevaluation cadence must be 100ms or 1s')
     if c['start_epoch'] < time.time()+32:
         raise ValueError('need at least 32 seconds observed neutral warmup after launch')
     for name in ('model','guard'):
@@ -87,7 +90,7 @@ def main():
     p.add_argument('--log',required=True)
     p.add_argument('--summary',default='/tmp/grid_rolling_summary.json')
     p.add_argument('--actuate-experimental',action='store_true',
-                   help='explicitly accept rolling-input technical control; not a scored episode')
+                   help='explicit rolling-input control; outcome scoring requires a separate verified capture')
     args=p.parse_args()
     if not args.actuate_experimental:p.error('actuation requires the explicit experimental flag')
     config=load_config(args.config)
@@ -98,7 +101,8 @@ def main():
     messages=importlib.import_module('oai-oran-protolib.builds.ran_messages_pb2')
     evidence=Evidence(clock_id)
     engine=PollGuard(config['model'],config['guard'],config['start_epoch'],config['horizon'],
-                     config['bridge_id'],config.get('max_evidence_age_s',1.5))
+                     config['bridge_id'],config.get('max_evidence_age_s',1.5),
+                     config.get('guard_check_interval_s',.1))
     log=open(args.log,'x',buffering=1)
     def record(kind,**data):
         data.update(schema='grid_poll_runtime_v1',record_type=kind,run=config['id'],
@@ -106,7 +110,8 @@ def main():
         log.write(json.dumps(data,allow_nan=False,separators=(',',':'))+'\n')
     record('start',config=config,clock_id=clock_id,
            measurement_path='E2_source_timestamps_plus_authenticated_local_summary_stream',
-           efficacy_evaluation=False,legacy_campaign_compatible=False)
+           efficacy_evaluation=config.get('scientific_scope')=='matched_online_guard_cadence_comparison_arm',
+           legacy_campaign_compatible=False)
     # Fail rather than sharing the control port with a legacy xApp.
     server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
